@@ -1,0 +1,21 @@
+# Local credentials & runtime session state (NEVER commit)
+.kissshot_secrets.json
+.kissshot_bridge_state.json
+outputs/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Encrypted archives & temporary blobs
+*.enc
+*.zip
+*.bin
+.DS_Store
+Thumbs.db
