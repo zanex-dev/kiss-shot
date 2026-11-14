@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-端到端密码学、HTTP/SSE 环回网关、防重放/防截断与仓库脱敏审计测试套件
+端到端密码学、域分离 AEAD、反压缩炸弹、DNS Rebinding 防御、HTTP/SSE 环回网关与仓库脱敏测试套件 (v0.2.0)
 运行方式: python -m unittest discover -s tests -v
 """
 
 from __future__ import annotations
 
+import ast
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
 from pathlib import Path
 import secrets
+import sys
 import tempfile
 import threading
 import time
@@ -21,8 +23,11 @@ import urllib.request
 import zipfile
 
 from cryptography.exceptions import InvalidTag
+import pyzipper
 
 from kiss_shot.crypto import (
+    AAD_ARCHIVE,
+    AAD_BLOB,
     aead_open,
     aead_seal,
     create_handshake_ticket,
@@ -31,11 +36,18 @@ from kiss_shot.crypto import (
     derive_session_cipher,
     encrypt_bytes_aes,
     encrypt_payload_hex,
+    load_encrypted_secrets,
     pack_encrypted_zip,
     parse_handshake_ticket,
+    save_encrypted_secrets,
     unpack_encrypted_zip,
 )
-from kiss_shot.local_bridge import LocalBridgeState, make_local_bridge_handler
+from kiss_shot.local_bridge import (
+    LocalBridgeState,
+    configure_local_bridge,
+    make_local_bridge_handler,
+    query_local_bridge_status,
+)
 from kiss_shot.remote_gateway import RemoteGatewayContext, make_gateway_handler
 
 
@@ -92,7 +104,8 @@ class _MockOpenAIBackendHandler(BaseHTTPRequestHandler):
                 }
                 raw = json.dumps(resp, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
+                # Simulate poisoned upstream sending text/html to verify local bridge XSS sanitization
+                self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
@@ -101,8 +114,8 @@ class _MockOpenAIBackendHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-class TestCryptoPrimitives(unittest.TestCase):
-    def test_payload_hex_roundtrip_and_tamper_rejection(self) -> None:
+class TestCryptoPrimitivesAndVault(unittest.TestCase):
+    def test_payload_hex_roundtrip_ttl_and_tamper_rejection(self) -> None:
         pwd = "correct-horse-battery-staple-2026"
         data = {"prompt": "机密多模态指令 🚀", "steps": 28, "nested": [1, 2, 3]}
         enc_hex = encrypt_payload_hex(data, pwd)
@@ -113,10 +126,30 @@ class TestCryptoPrimitives(unittest.TestCase):
         with self.assertRaises(InvalidTag):
             decrypt_payload_hex(enc_hex, "wrong-passphrase")
 
-        # 翻转密文末尾字节必须触发 GCM 认证失败
         flipped = enc_hex[:-2] + ("00" if enc_hex[-2:] != "00" else "ff")
         with self.assertRaises(InvalidTag):
             decrypt_payload_hex(flipped, pwd)
+
+        # 签发超过 24 小时的过期密文必须被拒绝
+        expired_hex = encrypt_payload_hex(data, pwd, issued_at=int(time.time()) - 90_000)
+        with self.assertRaises(ValueError):
+            decrypt_payload_hex(expired_hex, pwd)
+
+    def test_local_secrets_vault_at_rest_protection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpd:
+            vault_path = os.path.join(tmpd, ".kissshot_secrets.json")
+            sample = {"passphrase": "VaultSuperSecret_99!", "hf_token": "hf_VaultWriteToken_ABC"}
+            save_encrypted_secrets(vault_path, sample)
+            raw_text = Path(vault_path).read_text(encoding="utf-8")
+            self.assertNotIn("VaultSuperSecret_99!", raw_text)
+            self.assertNotIn("hf_VaultWriteToken_ABC", raw_text)
+            if sys.platform == "win32":
+                self.assertIn("dpapi_v2", raw_text)
+            else:
+                mode = os.stat(vault_path).st_mode & 0o777
+                self.assertEqual(mode, 0o600)
+            loaded = load_encrypted_secrets(vault_path)
+            self.assertEqual(loaded, sample)
 
     def test_binary_aes_roundtrip(self) -> None:
         pwd = "binary-blob-secret-key"
@@ -125,21 +158,25 @@ class TestCryptoPrimitives(unittest.TestCase):
         self.assertNotEqual(enc, raw)
         self.assertEqual(decrypt_bytes_aes(enc, pwd), raw)
 
-    def test_wz_aes_zip_obfuscation_and_stored_mode(self) -> None:
+    def test_double_aead_zip_anti_grafting_and_anti_bomb(self) -> None:
         pwd = "zip-archive-passphrase"
         items = [("png", b"\x89PNG\r\n\x1a\nmock-image-1"), ("mp4", b"\x00\x00\x00\x18ftypmp42mock-video")]
         archive_bytes = pack_encrypted_zip(items, pwd, extra_meta={"seed": 42})
 
-        # 校验 ZIP 目录头：不泄露 .png/.mp4 扩展名，且采用 WinZip AES (method=99) + ZIP_STORED 无压缩防侧信道
-        with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as zf_inspect:
+        # 外层必须是完整 AES-256-GCM 密文信封，绝不暴露 PK\x03\x04 头与 manifest.json 文件名
+        self.assertFalse(archive_bytes.startswith(b"PK\x03\x04"))
+        self.assertNotIn(b"manifest.json", archive_bytes)
+
+        # 解开外层信封后校验内层 WZ_AES (method=99) + ZIP_STORED 无压缩防侧信道
+        inner_zip = decrypt_bytes_aes(archive_bytes, pwd, aad=AAD_ARCHIVE)
+        with zipfile.ZipFile(io.BytesIO(inner_zip), "r") as zf_inspect:
             names = zf_inspect.namelist()
             self.assertIn("chunk_000.dat", names)
             self.assertIn("chunk_001.dat", names)
             self.assertIn("manifest.json", names)
             for info in zf_inspect.infolist():
-                self.assertEqual(info.compress_type, 99)  # 99 = WinZip AES (0x9901), 非脆弱传统 ZipCrypto
-                self.assertTrue(info.flag_bits & 0x1)  # Encrypted flag set
-                # ZIP_STORED 下密文长度 = 原始明文长度 + 16B Salt + 2B pwd_verify + 10B HMAC-SHA1 = 明文 + 28B
+                self.assertEqual(info.compress_type, 99)
+                self.assertTrue(info.flag_bits & 0x1)
                 if info.filename == "chunk_000.dat":
                     self.assertEqual(info.compress_size, len(items[0][1]) + 28)
 
@@ -153,11 +190,37 @@ class TestCryptoPrimitives(unittest.TestCase):
                 self.assertEqual(f0.read(), items[0][1])
                 self.assertEqual(f1.read(), items[1][1])
 
-    def test_dynamic_handshake_ticket(self) -> None:
+            # 1. 跨域密文嫁接（把 AAD_BLOB 二进制密文伪造投递给归档解包器）必须触发 InvalidTag
+            blob_ct = encrypt_bytes_aes(b"raw-image-blob", pwd, aad=AAD_BLOB)
+            with self.assertRaises(InvalidTag):
+                unpack_encrypted_zip(blob_ct, pwd, tmpd)
+
+            # 2. 伪造 ZIP_DEFLATED 压缩炸弹必须被解包策略当场拒收
+            bomb_buf = io.BytesIO()
+            with pyzipper.AESZipFile(bomb_buf, "w", compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES) as zf:
+                zf.setpassword(pwd.encode("utf-8"))
+                zf.setencryption(pyzipper.WZ_AES, nbits=256)
+                zf.writestr("chunk_000.dat", b"\x00" * 65536)
+                zf.writestr("manifest.json", json.dumps({"files": [{"inner": "chunk_000.dat", "ext": "bin"}]}).encode("utf-8"))
+            wrapped_bomb = encrypt_bytes_aes(bomb_buf.getvalue(), pwd, aad=AAD_ARCHIVE)
+            with self.assertRaises(ValueError):
+                unpack_encrypted_zip(wrapped_bomb, pwd, tmpd)
+
+            # 3. 伪造路径穿越扩展名必须被拦截
+            trav_buf = io.BytesIO()
+            with pyzipper.AESZipFile(trav_buf, "w", compression=pyzipper.ZIP_STORED, encryption=pyzipper.WZ_AES) as zf:
+                zf.setpassword(pwd.encode("utf-8"))
+                zf.setencryption(pyzipper.WZ_AES, nbits=256)
+                zf.writestr("chunk_000.dat", b"x")
+                zf.writestr("manifest.json", json.dumps({"files": [{"inner": "chunk_000.dat", "ext": "../../pwn"}]}).encode("utf-8"))
+            wrapped_trav = encrypt_bytes_aes(trav_buf.getvalue(), pwd, aad=AAD_ARCHIVE)
+            with self.assertRaises(ValueError):
+                unpack_encrypted_zip(wrapped_trav, pwd, tmpd)
+
+    def test_dynamic_handshake_ticket_and_domain_separation(self) -> None:
         pwd = "session-handshake-secret"
         t1, r1, s1 = create_handshake_ticket("https://gpu-node.example.com/", pwd)
         t2, r2, s2 = create_handshake_ticket("https://gpu-node.example.com/", pwd)
-        # 每次生成的动态路由和会话盐必须随机互异
         self.assertNotEqual(r1, r2)
         self.assertNotEqual(s1, s2)
 
@@ -165,6 +228,11 @@ class TestCryptoPrimitives(unittest.TestCase):
         self.assertEqual(parsed["base_url"], "https://gpu-node.example.com")
         self.assertEqual(parsed["route"], r1)
         self.assertEqual(parsed["session_salt"], s1)
+
+        # 普通任务密文不能伪装成握手票据通过验证
+        forged_task_hex = encrypt_payload_hex({"type": "kissshot_handshake", "url": "https://x.example.com", "route": "/v1/a", "salt": s1.hex()}, pwd)
+        with self.assertRaises(InvalidTag):
+            parse_handshake_ticket(forged_task_hex, pwd)
 
 
 class TestEndToEndBridgeAndSecurityDefenses(unittest.TestCase):
@@ -188,7 +256,10 @@ class TestEndToEndBridgeAndSecurityDefenses(unittest.TestCase):
 
         # 3. Local OpenAI E2EE Bridge
         self.loc_state = LocalBridgeState(work_dir=self.tmp_dir.name)
-        self.loc_srv = ThreadingHTTPServer(("127.0.0.1", 0), make_local_bridge_handler(self.loc_state))
+        self.loc_srv = ThreadingHTTPServer(
+            ("127.0.0.1", 0),
+            make_local_bridge_handler(self.loc_state),
+        )
         self.loc_port = self.loc_srv.server_address[1]
         threading.Thread(target=self.loc_srv.serve_forever, daemon=True).start()
 
@@ -203,11 +274,20 @@ class TestEndToEndBridgeAndSecurityDefenses(unittest.TestCase):
         self.mock_engine.server_close()
         self.tmp_dir.cleanup()
 
-    def test_full_handshake_json_and_streaming_sse(self) -> None:
-        ok, msg = self.loc_state.configure_with_ticket(self.ticket, passphrase_override=self.passphrase)
+    def test_full_handshake_json_streaming_and_xss_sanitization(self) -> None:
+        ok, msg = configure_local_bridge(
+            self.ticket,
+            passphrase=self.passphrase,
+            port=self.loc_port,
+            work_dir=self.tmp_dir.name,
+        )
         self.assertTrue(ok, msg)
 
-        # A. 非流式请求端到端加解密往返
+        st = query_local_bridge_status(port=self.loc_port, work_dir=self.tmp_dir.name)
+        self.assertIsNotNone(st)
+        self.assertTrue(st["connected"])
+
+        # A. 非流式请求端到端加解密往返 + 上游 text/html XSS 响应头强制清洗校验
         req_body = json.dumps(
             {
                 "model": "gpt-4o",
@@ -222,6 +302,8 @@ class TestEndToEndBridgeAndSecurityDefenses(unittest.TestCase):
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
+            self.assertIn("application/json", (resp.headers.get("Content-Type") or "").lower())
+            self.assertEqual((resp.headers.get("X-Content-Type-Options") or "").lower(), "nosniff")
             out = json.loads(resp.read().decode("utf-8"))
         self.assertEqual(out["choices"][0]["message"]["content"], "Echo:秘密多模态测试载荷")
 
@@ -248,7 +330,49 @@ class TestEndToEndBridgeAndSecurityDefenses(unittest.TestCase):
                     collected.append(obj["choices"][0]["delta"].get("content", ""))
         self.assertEqual("".join(collected), "零信任端到端回显:流式完整性验证")
 
-    def test_scanner_403_and_anti_replay_defense(self) -> None:
+    def test_local_bridge_dns_rebinding_cross_site_and_admin_ipc_auth(self) -> None:
+        # 1. DNS Rebinding 伪造 Host 头必须返回 403
+        rebind_req = urllib.request.Request(
+            f"http://127.0.0.1:{self.loc_port}/v1/models",
+            headers={"Host": f"rebind.attacker.example:{self.loc_port}"},
+            method="GET",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as cm_host:
+            urllib.request.urlopen(rebind_req, timeout=3)
+        self.assertEqual(cm_host.exception.code, 403)
+
+        # 2. Sec-Fetch-Site: cross-site 跨站请求必须返回 403
+        sfs_req = urllib.request.Request(
+            f"http://127.0.0.1:{self.loc_port}/v1/models",
+            headers={"Sec-Fetch-Site": "cross-site"},
+            method="GET",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as cm_sfs:
+            urllib.request.urlopen(sfs_req, timeout=3)
+        self.assertEqual(cm_sfs.exception.code, 403)
+
+        # 3. 外部网页 Origin 必须返回 403
+        origin_req = urllib.request.Request(
+            f"http://127.0.0.1:{self.loc_port}/v1/models",
+            headers={"Origin": "https://malicious.example"},
+            method="GET",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as cm_orig:
+            urllib.request.urlopen(origin_req, timeout=3)
+        self.assertEqual(cm_orig.exception.code, 403)
+
+        # 4. 未携带 X-KissShot-Admin-Token 的管理接口调用必须返回 403
+        unauth_cfg = urllib.request.Request(
+            f"http://127.0.0.1:{self.loc_port}/__kissshot/configure",
+            data=b'{"ticket":"x"}',
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as cm_adm:
+            urllib.request.urlopen(unauth_cfg, timeout=3)
+        self.assertEqual(cm_adm.exception.code, 403)
+
+    def test_scanner_403_ssrf_allowlist_and_anti_replay_defense(self) -> None:
         # 1. 未授权路径探测或 GET 扫描必须返回 403
         for bad_url, method in [
             (f"http://127.0.0.1:{self.rem_port}/v1/models", "GET"),
@@ -260,12 +384,20 @@ class TestEndToEndBridgeAndSecurityDefenses(unittest.TestCase):
                 urllib.request.urlopen(req, timeout=3)
             self.assertEqual(cm.exception.code, 403)
 
-        # 2. 抓包重放攻击验证：完全合法的加密请求帧第一次通过，第二次重放必须被 ReplayGuard 拦截返回 403
         cipher = derive_session_cipher(self.passphrase, self.rem_ctx.session_salt)
+        url = f"http://127.0.0.1:{self.rem_port}{self.rem_ctx.route_path}"
+
+        # 2. 即使通过认证，尝试访问非白名单内部管理路径 (/admin/internal) 也必须被 SSRF 白名单拦截返回 403
+        ssrf_meta = json.dumps({"id": "ssrf_probe_id_0001", "method": "GET", "path": "/admin/internal", "ts": int(time.time())}).encode("utf-8")
+        ssrf_wire = aead_seal(cipher, ssrf_meta + b"\n", f"kissshot-c2s-v1:{self.rem_ctx.route_path}".encode("utf-8"))
+        ssrf_req = urllib.request.Request(url, data=ssrf_wire, headers={"Content-Type": "application/octet-stream"}, method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as cm_ssrf:
+            urllib.request.urlopen(ssrf_req, timeout=3)
+        self.assertEqual(cm_ssrf.exception.code, 403)
+
+        # 3. 抓包重放攻击验证：第一次通过，第二次重放必须返回 403
         meta = json.dumps({"id": "replay_test_id_0001", "method": "GET", "path": "/health", "ts": int(time.time())}).encode("utf-8")
         wire = aead_seal(cipher, meta + b"\n", f"kissshot-c2s-v1:{self.rem_ctx.route_path}".encode("utf-8"))
-
-        url = f"http://127.0.0.1:{self.rem_port}{self.rem_ctx.route_path}"
         req1 = urllib.request.Request(url, data=wire, headers={"Content-Type": "application/octet-stream"}, method="POST")
         with urllib.request.urlopen(req1, timeout=3) as r1:
             self.assertEqual(r1.status, 200)
@@ -276,7 +408,6 @@ class TestEndToEndBridgeAndSecurityDefenses(unittest.TestCase):
         self.assertEqual(cm_replay.exception.code, 403)
 
     def test_sse_truncation_without_eof_is_detected(self) -> None:
-        # 模拟恶意反向代理在中途强行掐断 SSE 连接（缺失加密 EOF 认证帧）
         route = "/v1/ks-trunc-test"
         salt = secrets.token_bytes(16)
         cipher = derive_session_cipher(self.passphrase, salt)
@@ -308,7 +439,6 @@ class TestEndToEndBridgeAndSecurityDefenses(unittest.TestCase):
                 c0 = aead_seal(cipher, b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n', f"kissshot-s2c:{req_id}:0".encode("ascii")).hex()
                 self.wfile.write(f"data: {c0}\n\n".encode("ascii"))
                 self.wfile.flush()
-                # 故意不发送 data: EOF:... 直接关闭连接
 
         trunc_srv = ThreadingHTTPServer(("127.0.0.1", 0), _TruncatingGatewayHandler)
         t_port = trunc_srv.server_address[1]
@@ -333,14 +463,22 @@ class TestEndToEndBridgeAndSecurityDefenses(unittest.TestCase):
 
 
 class TestRepositoryHygieneAndIsolation(unittest.TestCase):
+    def test_notebooks_ast_valid(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        for nb_path in (repo_root / "notebooks").glob("*.ipynb"):
+            nb = json.loads(nb_path.read_text(encoding="utf-8"))
+            for cell in nb.get("cells", []):
+                if cell.get("cell_type") == "code":
+                    ast.parse("".join(cell.get("source", [])))
+
     def test_zero_personal_paths_or_private_fingerprints(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent
-        # 通过拼接构造敏感检测词，确保本测试文件自身亦不出现原始字面量
         forbidden_tokens = [
             "C:\\Users\\" + "shana",
             "C:/Users/" + "shana",
             "BRIDGE_" + "TICKET",
             "colab_gpu_" + "aes256",
+            "colab-" + "gpu:",
             "proj-runtime-" + "cache",
             "tensor_" + "worker",
             "edge_" + "connector",

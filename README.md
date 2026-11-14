@@ -9,7 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="#verification--test-suite"><img src="https://img.shields.io/badge/tests-8%2F8%20passing-brightgreen" alt="CI" /></a>
+  <a href="#verification--test-suite"><img src="https://img.shields.io/badge/tests-11%2F11%20passing-brightgreen" alt="CI" /></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-v0.2.0-be123c" alt="Version v0.2.0" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-e11d48.svg" alt="License: MIT" /></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB.svg" alt="Python 3.10+" /></a>
   <img src="https://img.shields.io/badge/codename-Kiss--Shot%20(%E5%A7%AC%E4%B8%9D%E7%A7%80%E5%BF%92)-9f1239" alt="Codename" />
@@ -25,10 +26,11 @@ When renting cloud GPUs on shared or third-party infrastructure (RunPod, Vast.ai
 
 **`kiss-shot`** (*Codename: Kiss-Shot / 姬丝秀忒*) establishes an application-layer zero-trust cryptographic bond directly from `127.0.0.1` on your local workstation into the remote GPU process memory:
 
-1. **Streaming OpenAI-Compatible AEAD Bridge**: Exposes a standard `http://127.0.0.1:18443/v1` endpoint locally (drop-in for the OpenAI SDK, LangChain, Cursor, Continue, OpenWebUI, or SillyTavern) while sealing every request and streaming SSE token chunk with `PBKDF2-HMAC-SHA256` (`210,000` iterations) + `AES-256-GCM`.
-2. **Dynamic Ephemeral Routing & Anti-Replay**: Each remote gateway session generates a fresh random route (`/v1/ks-<random>`) and 128-bit session salt embedded inside an authenticated `KISSSHOT_TICKET:...` handshake string, backed by a timestamp window (`±300s`) and a bounded request-ID replay filter (`ReplayGuard`). Unauthenticated scanners immediately receive `403 Forbidden`.
+1. **Streaming OpenAI-Compatible AEAD Bridge**: Exposes a standard `http://127.0.0.1:18443/v1` endpoint locally (drop-in for the OpenAI SDK, LangChain, Cursor, Continue, OpenWebUI, or SillyTavern) while sealing every request and streaming SSE token chunk with `PBKDF2-HMAC-SHA256` (`210,000` iterations) + `AES-256-GCM`, strict domain-separated AADs (`AAD_PAYLOAD`, `AAD_TICKET`, `AAD_BLOB`, `AAD_ARCHIVE`), and 24-hour authenticated TTL envelopes.
+2. **Dynamic Ephemeral Routing, Anti-Replay & SSRF Allowlist**: Each remote gateway session generates a fresh random route (`/v1/ks-<random>`) and 128-bit session salt embedded inside an authenticated `KISSSHOT_TICKET:...` handshake string, backed by a `±300s` clock check, a bounded request-ID replay filter (`ReplayGuard`), `BoundedSemaphore` concurrency control, and strict upstream path allowlisting (`/v1/*`, `/health`). Unauthenticated probes immediately receive `403 Forbidden`.
 3. **Stream Integrity & Truncation Detection**: Streaming SSE chunks bind monotonic sequence numbers (`kissshot-s2c:<req_id>:<seq>`) and an authenticated termination tag (`EOF:...`) into GCM Additional Authenticated Data (AAD), defeating chunk reordering, injection, and silent middlebox truncation.
-4. **Burn-After-Reading Ciphertext Mailbox**: For asynchronous Diffusion/Video workloads (`SDXL`, `FLUX.1-schnell`, `Wan 2.1/2.2`), prompts and reference images are encrypted locally, inferred purely in memory (`BytesIO` / `/dev/shm`), packed into `256-bit WinZip AES` (`WZ_AES`, `ZIP_STORED` zero-compression to eliminate compression-ratio side channels, with obfuscated inner filenames), relayed via a private HuggingFace repository, and **deleted from remote storage immediately after verified local decryption**.
+4. **Double-AEAD Burn-After-Reading Ciphertext Mailbox**: For asynchronous Diffusion/Video workloads (`SDXL`, `FLUX.1-schnell`, `Wan 2.1/2.2`), prompts and reference images are encrypted locally, inferred purely in memory (`BytesIO` / `/dev/shm`), packed into a `256-bit WinZip AES` (`WZ_AES`, `ZIP_STORED` zero-compression + obfuscated inner filenames) archive wrapped inside an outer `AES-256-GCM` (`AAD_ARCHIVE`) envelope, verified with streaming anti-decompression-bomb guards (`ZIP_DEFLATED` rejection + `2 GiB` fuse), and **deleted from remote storage immediately after verified local decryption**.
+5. **Local Workstation & Daemon Hardening**: Protects local passphrases/tokens at rest via Windows `DPAPI` (`CryptProtectData`) or POSIX `0600` owner-only vaults, enforces `X-KissShot-Admin-Token` IPC authentication, blocks browser DNS Rebinding (`Host`) and `Sec-Fetch-Site: cross-site` attacks, sanitizes response MIME headers (`X-Content-Type-Options: nosniff`), and marks copied secrets as excluded from Windows Clipboard History & Cloud Sync with automatic timer scrubbing.
 
 ---
 
@@ -66,7 +68,10 @@ flowchart LR
 | Public URL / port scanners probing inference endpoints | Exposes `/v1/models` & API fingerprint | **Protected** (random dynamic route + `403 Forbidden` on unauthenticated bytes) |
 | Replay of captured encrypted HTTP requests | Vulnerable without app-layer nonces | **Protected** (`±300s` clock check + bounded `ReplayGuard` request-ID filter) |
 | SSE stream chunk reordering or premature truncation | Undetected partial output | **Protected** (per-chunk `seq` in AAD + mandatory authenticated `EOF` tag) |
-| Shared cloud disk retaining batch images/videos | Plaintext files on container disk | **Protected** (`BytesIO` / `/dev/shm` + `WZ_AES` 256-bit `ZIP_STORED` + burn-after-reading) |
+| Shared cloud disk retaining batch images/videos | Plaintext files on container disk | **Protected** (`BytesIO` / `/dev/shm` + outer `AES-256-GCM` + inner `WZ_AES` `ZIP_STORED` + burn-after-reading) |
+| Cross-context ciphertext grafting / ZIP bomb archive | Unchecked archive headers & compression | **Protected** (domain-separated AADs, 24h TTL, `ZIP_DEFLATED` rejection & `2 GiB` streaming cap) |
+| Malicious browser tab probing `127.0.0.1` (DNS Rebinding / XSS) | Wildcard CORS or unauthenticated loopback | **Protected** (strict `Host` & `Sec-Fetch-Site` guard, `X-KissShot-Admin-Token` IPC, `nosniff` sanitization) |
+| Plaintext credentials on disk or Cloud Clipboard sync | Cleartext JSON & persistent clipboard history | **Protected** (Windows `DPAPI` / POSIX `0600` vault + cloud-clipboard exclusion & auto-scrub) |
 
 > **Scope Note**: Application-layer E2EE protects data in transit across untrusted networks/proxies and avoids plaintext persistence on remote storage. Once decrypted inside the remote GPU process for matrix multiplication, a malicious host hypervisor with raw physical RAM/VRAM dump access remains outside the boundary of software-only encryption (require hardware confidential computing / H100 TEE for host-memory isolation).
 

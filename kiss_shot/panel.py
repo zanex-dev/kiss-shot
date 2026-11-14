@@ -21,6 +21,7 @@ from typing import Any, Dict, List
 
 from huggingface_hub import HfApi, hf_hub_download
 
+from .clipboard import clear_clipboard_text, read_clipboard_text, write_clipboard_secret
 from .crypto import (
     DEFAULT_LOCAL_PORT,
     DEFAULT_MAILBOX_REPO_NAME,
@@ -28,6 +29,8 @@ from .crypto import (
     MEDIA_PRESETS,
     encrypt_bytes_aes,
     encrypt_payload_hex,
+    load_encrypted_secrets,
+    save_encrypted_secrets,
     unpack_encrypted_zip,
 )
 from .local_bridge import (
@@ -50,26 +53,20 @@ def _open_directory_cross_platform(path: str) -> None:
 
 
 def load_secrets(work_dir: str) -> Dict[str, Any]:
-    sp = default_secrets_path(work_dir)
-    if os.path.exists(sp):
-        try:
-            with open(sp, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
-        "passphrase": "",
-        "hf_user": "",
-        "hf_token": "",
-        "mailbox_suffix": DEFAULT_MAILBOX_REPO_NAME,
-        "client_dir": "",
-    }
+    return load_encrypted_secrets(
+        default_secrets_path(work_dir),
+        defaults={
+            "passphrase": "",
+            "hf_user": "",
+            "hf_token": "",
+            "mailbox_suffix": DEFAULT_MAILBOX_REPO_NAME,
+            "client_dir": "",
+        },
+    )
 
 
 def save_secrets(work_dir: str, data: Dict[str, Any]) -> None:
-    sp = default_secrets_path(work_dir)
-    with open(sp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    save_encrypted_secrets(default_secrets_path(work_dir), data)
 
 
 class ZeroTrustBridgeApp(tk.Tk):
@@ -78,6 +75,7 @@ class ZeroTrustBridgeApp(tk.Tk):
         self.work_dir = os.path.abspath(work_dir or os.getcwd())
         self.port = port
         self.output_dir = os.path.join(self.work_dir, "outputs")
+        self._clip_timer_id: str | None = None
 
         self.title("Kiss-Shot · 零信任端到端加密推理与密文信箱控制台")
         self.geometry("980x760")
@@ -118,6 +116,9 @@ class ZeroTrustBridgeApp(tk.Tk):
         ttk.Label(top_bar, textvariable=self.status_var, foreground="#1a6b3c").pack(side=tk.LEFT)
         ttk.Button(top_bar, text="📁 打开本地解密产物目录", command=lambda: _open_directory_cross_platform(self.output_dir)).pack(
             side=tk.RIGHT
+        )
+        ttk.Button(top_bar, text="🧹 擦除剪贴板", command=self._manual_scrub_clipboard).pack(
+            side=tk.RIGHT, padx=(0, 8)
         )
 
         nb = ttk.Notebook(self)
@@ -308,6 +309,7 @@ class ZeroTrustBridgeApp(tk.Tk):
         ttk.Label(box, text="1. 主加密口令 (Passphrase · 必填):").grid(row=0, column=0, sticky=tk.W, pady=6)
         ttk.Entry(box, textvariable=self.var_pwd, show="*", width=44).grid(row=0, column=1, sticky=tk.W, padx=8)
         ttk.Button(box, text="🎲 生成高熵口令", command=self._gen_random_pwd).grid(row=0, column=2, padx=4)
+        ttk.Button(box, text="📋 复制口令(90s自毁)", command=self._copy_pwd_ephemeral).grid(row=0, column=3, padx=4)
 
         ttk.Label(box, text="2. HuggingFace Write Token (用于密文信箱):").grid(row=1, column=0, sticky=tk.W, pady=6)
         ttk.Entry(box, textvariable=self.var_hf_token, show="*", width=44).grid(row=1, column=1, sticky=tk.W, padx=8)
@@ -353,11 +355,46 @@ class ZeroTrustBridgeApp(tk.Tk):
         self.txt_neg.delete("1.0", tk.END)
         self.txt_neg.insert("1.0", m["default_neg"])
 
+    def _copy_ephemeral_secret(self, text: str, ttl_ms: int = 90_000) -> None:
+        if not text:
+            return
+        if not write_clipboard_secret(text):
+            self.clipboard_clear()
+            self.clipboard_append(text)
+        if self._clip_timer_id is not None:
+            try:
+                self.after_cancel(self._clip_timer_id)
+            except Exception:
+                pass
+
+        def _scrub_if_unchanged() -> None:
+            self._clip_timer_id = None
+            try:
+                if read_clipboard_text().strip() == text.strip():
+                    clear_clipboard_text()
+            except Exception:
+                pass
+
+        self._clip_timer_id = self.after(ttl_ms, _scrub_if_unchanged)
+
+    def _manual_scrub_clipboard(self) -> None:
+        clear_clipboard_text()
+        self.status_var.set("🧹 已清空系统剪贴板")
+
+    def _copy_pwd_ephemeral(self) -> None:
+        pwd = self.var_pwd.get().strip()
+        if not pwd:
+            messagebox.showwarning("口令为空", "请先填写或生成主加密口令！")
+            return
+        self._copy_ephemeral_secret(pwd)
+        self.status_var.set("📋 主口令已复制（已标记防剪贴板历史/防云同步，90 秒后自动销毁）")
+
     def _gen_random_pwd(self) -> None:
         pwd = secrets.token_urlsafe(20)
         self.var_pwd.set(pwd)
         self._save_settings(silent=True)
-        messagebox.showinfo("已生成高熵口令", "已生成 160-bit 高熵加密口令并保存至本机 .kissshot_secrets.json。")
+        self._copy_ephemeral_secret(pwd)
+        messagebox.showinfo("已生成高熵口令", "已生成 160-bit 高熵加密口令并加密保存至本机（已复制，90 秒后自动擦除剪贴板）。")
 
     def _pick_client_dir(self) -> None:
         d = filedialog.askdirectory(title="选择本地客户端根目录（可选）")
@@ -442,6 +479,7 @@ class ZeroTrustBridgeApp(tk.Tk):
             messagebox.showerror("参数格式错误", str(exc))
             return
 
+        is_custom_repo = bool(custom and "/" in custom)
         payload = {
             "type": "kissshot_llm_serve",
             "preset_key": llm_key,
@@ -451,14 +489,14 @@ class ZeroTrustBridgeApp(tk.Tk):
             "mmproj_file": spec["mmproj_file"],
             "ctx_size": ctx_size,
             "img_tokens": img_tokens,
-            "hf_token": self.cfg.get("hf_token", ""),
+            # Least privilege: only attach HF token when pulling a user-specified custom repository
+            "hf_token": self.cfg.get("hf_token", "") if is_custom_repo else "",
         }
         hex_tok = encrypt_payload_hex(payload, pwd)
         self.txt_llm_hex.delete("1.0", tk.END)
         self.txt_llm_hex.insert("1.0", hex_tok)
-        self.clipboard_clear()
-        self.clipboard_append(hex_tok)
-        self.status_var.set("✅ 远端启动密文 KISSSHOT_LLM_HEX 已生成并复制到剪贴板")
+        self._copy_ephemeral_secret(hex_tok)
+        self.status_var.set("✅ 远端启动密文 KISSSHOT_LLM_HEX 已生成并复制（90 秒自动销毁剪贴板）")
 
     def _bind_optional_client(self) -> None:
         cdir = self.cfg.get("client_dir", "").strip() or self.var_client_dir.get().strip()
@@ -494,8 +532,8 @@ class ZeroTrustBridgeApp(tk.Tk):
         self.status_var.set("正在与远端动态路由执行端到端 AES-256-GCM 双向认证握手...")
 
         def worker() -> None:
-            ok, msg = configure_local_bridge(raw, self.cfg["passphrase"], port=self.port)
-            st = query_local_bridge_status(self.port) or {}
+            ok, msg = configure_local_bridge(raw, self.cfg["passphrase"], port=self.port, work_dir=self.work_dir)
+            st = query_local_bridge_status(self.port, work_dir=self.work_dir) or {}
             self.after(0, lambda: self._on_ticket_bound(ok, msg, st))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -503,8 +541,10 @@ class ZeroTrustBridgeApp(tk.Tk):
     def _on_ticket_bound(self, ok: bool, msg: str, st: Dict[str, Any]) -> None:
         self._refresh_bridge_ui(st)
         if ok:
-            self.status_var.set(f"✅ {msg}")
-            messagebox.showinfo("握手成功", f"{msg}\n\n本地端点已就绪：http://127.0.0.1:{self.port}/v1")
+            self.var_ticket_input.set("")
+            clear_clipboard_text()
+            self.status_var.set(f"✅ {msg}（已自动擦除剪贴板票据）")
+            messagebox.showinfo("握手成功", f"{msg}\n\n剪贴板票据已自动销毁。\n本地端点已就绪：http://127.0.0.1:{self.port}/v1")
         else:
             self._on_error("握手未通过", msg)
 
@@ -526,7 +566,7 @@ class ZeroTrustBridgeApp(tk.Tk):
 
     def _poll_bridge_status(self) -> None:
         def worker() -> None:
-            st = query_local_bridge_status(self.port)
+            st = query_local_bridge_status(self.port, work_dir=self.work_dir)
             if st:
                 self.after(0, lambda s=st: self._refresh_bridge_ui(s))
 
@@ -604,9 +644,8 @@ class ZeroTrustBridgeApp(tk.Tk):
     def _on_media_hex_ready(self, hex_tok: str) -> None:
         self.txt_media_hex.delete("1.0", tk.END)
         self.txt_media_hex.insert("1.0", hex_tok)
-        self.clipboard_clear()
-        self.clipboard_append(hex_tok)
-        self.status_var.set("✅ 任务密文 KISSSHOT_TASK_HEX 已生成并复制至剪贴板")
+        self._copy_ephemeral_secret(hex_tok)
+        self.status_var.set("✅ 任务密文 KISSSHOT_TASK_HEX 已生成并复制（90 秒自动销毁剪贴板）")
 
     def _pull_and_burn_inbox(self) -> None:
         if not self._save_settings(silent=True):

@@ -1,6 +1,7 @@
 # Local credentials & runtime session state (NEVER commit)
 .kissshot_secrets.json
 .kissshot_bridge_state.json
+.kissshot_ipc.json
 outputs/
 
 # Python artifacts

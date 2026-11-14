@@ -1,11 +1,16 @@
 """Kiss-Shot (kiss_shot) — Application-layer E2EE for remote AI inference."""
 
 from .crypto import (
+    AAD_ARCHIVE,
+    AAD_BLOB,
+    AAD_PAYLOAD,
+    AAD_TICKET,
     DEFAULT_LOCAL_PORT,
     DEFAULT_MAILBOX_REPO_NAME,
     DEFAULT_MODEL_ALIAS,
     KDF_ITERATIONS,
     LLM_PRESETS,
+    MAX_PAYLOAD_TTL_SECONDS,
     MEDIA_PRESETS,
     TICKET_PREFIX,
     aead_open,
@@ -16,19 +21,26 @@ from .crypto import (
     derive_session_cipher,
     encrypt_bytes_aes,
     encrypt_payload_hex,
+    load_encrypted_secrets,
     pack_encrypted_zip,
     parse_handshake_ticket,
+    save_encrypted_secrets,
     unpack_encrypted_zip,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "__version__",
+    "AAD_ARCHIVE",
+    "AAD_BLOB",
+    "AAD_PAYLOAD",
+    "AAD_TICKET",
     "DEFAULT_LOCAL_PORT",
     "DEFAULT_MAILBOX_REPO_NAME",
     "DEFAULT_MODEL_ALIAS",
     "KDF_ITERATIONS",
     "LLM_PRESETS",
+    "MAX_PAYLOAD_TTL_SECONDS",
     "MEDIA_PRESETS",
     "TICKET_PREFIX",
     "aead_open",
@@ -39,7 +51,9 @@ __all__ = [
     "derive_session_cipher",
     "encrypt_bytes_aes",
     "encrypt_payload_hex",
+    "load_encrypted_secrets",
     "pack_encrypted_zip",
     "parse_handshake_ticket",
+    "save_encrypted_secrets",
     "unpack_encrypted_zip",
 ]
