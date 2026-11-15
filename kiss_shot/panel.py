@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import queue
 import secrets
 import subprocess
 import sys
@@ -17,7 +18,7 @@ import tempfile
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from huggingface_hub import HfApi, hf_hub_download
 
@@ -40,6 +41,35 @@ from .local_bridge import (
     query_local_bridge_status,
     start_local_bridge_background,
 )
+from .win_tray import (
+    MenuSpec,
+    Win32TrayController,
+    apply_tk_window_icon,
+    bring_tk_window_to_front,
+    enable_high_dpi,
+    set_app_user_model_id,
+    signal_existing_instance,
+)
+
+APP_USER_MODEL_ID = "Trinity.KissShot.Panel"
+TRAY_CLASS_NAME = "KissShotTrayHost_v1"
+PANEL_WINDOW_TITLE = "Kiss-Shot · 零信任端到端加密推理与密文信箱控制台"
+
+
+def _get_icon_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "assets" / "app.ico"
+
+
+def _resolve_default_work_dir(explicit_dir: Optional[str]) -> str:
+    if explicit_dir:
+        return os.path.abspath(explicit_dir)
+    cwd = os.path.abspath(os.getcwd())
+    if os.path.isfile(default_secrets_path(cwd)):
+        return cwd
+    repo_root = Path(__file__).resolve().parent.parent
+    if (repo_root / "pyproject.toml").is_file():
+        return str(repo_root)
+    return cwd
 
 
 def _open_directory_cross_platform(path: str) -> None:
@@ -70,16 +100,31 @@ def save_secrets(work_dir: str, data: Dict[str, Any]) -> None:
 
 
 class ZeroTrustBridgeApp(tk.Tk):
-    def __init__(self, work_dir: str | None = None, port: int = DEFAULT_LOCAL_PORT) -> None:
+    def __init__(
+        self,
+        work_dir: str | None = None,
+        port: int = DEFAULT_LOCAL_PORT,
+        start_minimized: bool = False,
+        enable_tray: bool = True,
+    ) -> None:
+        enable_high_dpi()
+        set_app_user_model_id(APP_USER_MODEL_ID)
         super().__init__()
-        self.work_dir = os.path.abspath(work_dir or os.getcwd())
+        self.work_dir = _resolve_default_work_dir(work_dir)
         self.port = port
         self.output_dir = os.path.join(self.work_dir, "outputs")
         self._clip_timer_id: str | None = None
+        self._closing = False
+        self._hidden_to_tray = False
+        self._tray_hint_shown = False
+        self._ui_queue: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
+        self._tray: Optional[Win32TrayController] = None
 
-        self.title("Kiss-Shot · 零信任端到端加密推理与密文信箱控制台")
-        self.geometry("980x760")
+        self.title(PANEL_WINDOW_TITLE)
+        apply_tk_window_icon(self, _get_icon_path())
+        self.geometry("1020x780")
         self.minsize(880, 680)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.cfg = load_secrets(self.work_dir)
         self.llm_keys: List[str] = list(LLM_PRESETS.keys())
@@ -90,13 +135,118 @@ class ZeroTrustBridgeApp(tk.Tk):
         self._build_ui()
         self._apply_media_defaults(0)
 
+        if enable_tray and sys.platform == "win32":
+            self._tray = Win32TrayController(
+                class_name=TRAY_CLASS_NAME,
+                tooltip=f"Kiss-Shot · 本地加密网桥 127.0.0.1:{self.port}/v1",
+                ico_path=_get_icon_path(),
+                on_open=self.restore_from_tray,
+                menu_builder=self._build_tray_menu,
+                dispatch_ui=self._ui_call,
+            )
+            self._tray.start()
+
         start_local_bridge_background(
             port=self.port,
             work_dir=self.work_dir,
             watch_clipboard=True,
-            on_status_change=lambda st: self.after(0, lambda s=st: self._refresh_bridge_ui(s)),
+            on_status_change=lambda st: self._ui_call(lambda s=st: self._refresh_bridge_ui(s)),
         )
-        self.after(600, self._poll_bridge_status)
+        self.after(50, self._pump_ui_queue)
+        if start_minimized and self._tray is not None and self._tray.active:
+            self.hide_to_tray(notify=False)
+        else:
+            self.after(600, self._poll_bridge_status)
+
+    def _ui_call(self, cb: Callable[[], None]) -> None:
+        if self._closing:
+            return
+        self._ui_queue.put(cb)
+
+    def _pump_ui_queue(self) -> None:
+        if self._closing:
+            return
+        for _ in range(128):
+            try:
+                cb = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                cb()
+            except Exception:
+                pass
+        try:
+            delay_ms = 400 if self._hidden_to_tray else 50
+            self.after(delay_ms, self._pump_ui_queue)
+        except Exception:
+            pass
+
+    def _copy_bridge_endpoint(self) -> None:
+        url = f"http://127.0.0.1:{self.port}/v1"
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(url)
+            self.status_var.set(f"✅ 已复制本地加密网桥端点：{url}")
+        except Exception:
+            pass
+
+    def _build_tray_menu(self) -> List[MenuSpec]:
+        return [
+            ("✦ 打开控制台 (Kiss-Shot)", self.restore_from_tray),
+            None,
+            (f"📋 复制本地网桥地址 (127.0.0.1:{self.port}/v1)", self._copy_bridge_endpoint),
+            ("📥 检查并拉取密文信箱 (阅后即焚)", self._pull_and_burn_inbox),
+            ("🧹 立即擦除剪贴板密钥", self._manual_scrub_clipboard),
+            ("📁 打开本地解密产物目录", lambda: _open_directory_cross_platform(self.output_dir)),
+            None,
+            ("✕ 彻底退出 (关闭加密网桥)", self.exit_app),
+        ]
+
+    def hide_to_tray(self, notify: bool = True) -> None:
+        if self._closing:
+            return
+        if self._tray is None or not self._tray.active:
+            self.exit_app()
+            return
+        self._hidden_to_tray = True
+        try:
+            self.withdraw()
+        except Exception:
+            pass
+        if notify and not self._tray_hint_shown:
+            self._tray_hint_shown = True
+            self._tray.notify_balloon(
+                "Kiss-Shot 已驻留托盘",
+                f"本地加密网桥 (127.0.0.1:{self.port}/v1) 与剪贴板票据监听持续保活中。单击图标唤醒，右键可彻底退出。",
+            )
+
+    def restore_from_tray(self) -> None:
+        if self._closing:
+            return
+        was_hidden = self._hidden_to_tray
+        self._hidden_to_tray = False
+        bring_tk_window_to_front(self)
+        if was_hidden:
+            self.after(100, self._poll_bridge_status)
+
+    def exit_app(self) -> None:
+        self._closing = True
+        self._hidden_to_tray = False
+        if self._tray is not None:
+            try:
+                self._tray.stop()
+            except Exception:
+                pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def _on_close(self) -> None:
+        if self._tray is not None and self._tray.active:
+            self.hide_to_tray(notify=True)
+            return
+        self.exit_app()
 
     def _build_ui(self) -> None:
         style = ttk.Style(self)
@@ -114,6 +264,9 @@ class ZeroTrustBridgeApp(tk.Tk):
             value=f"就绪 · 本地 OpenAI 加密代理 http://127.0.0.1:{self.port}/v1 (PBKDF2 + AES-256-GCM AEAD)"
         )
         ttk.Label(top_bar, textvariable=self.status_var, foreground="#1a6b3c").pack(side=tk.LEFT)
+        ttk.Button(top_bar, text="✕ 退出", command=self.exit_app).pack(
+            side=tk.RIGHT, padx=(8, 0)
+        )
         ttk.Button(top_bar, text="📁 打开本地解密产物目录", command=lambda: _open_directory_cross_platform(self.output_dir)).pack(
             side=tk.RIGHT
         )
@@ -549,7 +702,7 @@ class ZeroTrustBridgeApp(tk.Tk):
             self._on_error("握手未通过", msg)
 
     def _refresh_bridge_ui(self, st: Dict[str, Any]) -> None:
-        if not st:
+        if not st or self._closing:
             return
         if st.get("connected") and not st.get("last_err"):
             cnt = st.get("req_count", 0)
@@ -557,18 +710,27 @@ class ZeroTrustBridgeApp(tk.Tk):
             self.var_bridge_status.set(
                 f"🟢 端到端 AEAD 已连通 ({masked}) -> 127.0.0.1:{self.port}/v1 | 已加密转发 {cnt} 次请求"
             )
+            if self._tray is not None and self._tray.active:
+                self._tray.update_tooltip(f"Kiss-Shot [已加密连通] · 127.0.0.1:{self.port}/v1 (已转发 {cnt} 次)")
         elif st.get("connected") and st.get("last_err"):
             self.var_bridge_status.set(f"🟠 隧道连接异常 ({st.get('last_err', '')[:55]})")
+            if self._tray is not None and self._tray.active:
+                self._tray.update_tooltip(f"Kiss-Shot [连接异常] · 127.0.0.1:{self.port}/v1")
         else:
             self.var_bridge_status.set(
                 f"🟡 本地加密网桥待命中 (127.0.0.1:{self.port}/v1) · 复制 KISSSHOT_TICKET 后自动秒连"
             )
+            if self._tray is not None and self._tray.active:
+                self._tray.update_tooltip(f"Kiss-Shot [待命监听] · 127.0.0.1:{self.port}/v1")
 
     def _poll_bridge_status(self) -> None:
+        if self._closing or self._hidden_to_tray:
+            return
+
         def worker() -> None:
             st = query_local_bridge_status(self.port, work_dir=self.work_dir)
             if st:
-                self.after(0, lambda s=st: self._refresh_bridge_ui(s))
+                self._ui_call(lambda s=st: self._refresh_bridge_ui(s))
 
         threading.Thread(target=worker, daemon=True).start()
         self.after(3000, self._poll_bridge_status)
@@ -727,6 +889,14 @@ class ZeroTrustBridgeApp(tk.Tk):
         messagebox.showerror(title, err)
 
 
-def run_panel(work_dir: str | None = None, port: int = DEFAULT_LOCAL_PORT) -> None:
-    app = ZeroTrustBridgeApp(work_dir=work_dir, port=port)
+def run_panel(
+    work_dir: str | None = None,
+    port: int = DEFAULT_LOCAL_PORT,
+    start_minimized: bool = False,
+) -> None:
+    enable_high_dpi()
+    set_app_user_model_id(APP_USER_MODEL_ID)
+    if signal_existing_instance(TRAY_CLASS_NAME, PANEL_WINDOW_TITLE):
+        return
+    app = ZeroTrustBridgeApp(work_dir=work_dir, port=port, start_minimized=start_minimized)
     app.mainloop()

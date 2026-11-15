@@ -466,13 +466,63 @@ class TestRepositoryHygieneAndIsolation(unittest.TestCase):
     def test_notebooks_ast_valid(self) -> None:
         import kiss_shot
 
-        self.assertEqual(kiss_shot.__version__, "1.0.0")
+        self.assertEqual(kiss_shot.__version__, "1.1.0")
         repo_root = Path(__file__).resolve().parent.parent
         for nb_path in (repo_root / "notebooks").glob("*.ipynb"):
             nb = json.loads(nb_path.read_text(encoding="utf-8"))
             for cell in nb.get("cells", []):
                 if cell.get("cell_type") == "code":
                     ast.parse("".join(cell.get("source", [])))
+
+    def test_win32_tray_and_shortcut_helpers(self) -> None:
+        from kiss_shot import __main__ as cli_mod
+        from kiss_shot import panel as panel_mod
+        from kiss_shot import win_tray
+
+        ico = panel_mod._get_icon_path()
+        self.assertTrue(ico.is_file())
+        svg = ico.with_name("logo.svg")
+        self.assertTrue(svg.is_file())
+
+        if sys.platform == "win32":
+            woke: list[int] = []
+            cls_name = f"KissShotTrayUnit_{os.getpid()}_{time.time_ns()}"
+            tray = win_tray.Win32TrayController(
+                class_name=cls_name,
+                tooltip="Kiss-Shot Unit Test",
+                ico_path=ico,
+                on_open=lambda: woke.append(1),
+                menu_builder=lambda: [("Open", lambda: None)],
+                dispatch_ui=lambda cb: cb(),
+            )
+            try:
+                tray.start()
+                self.assertNotEqual(tray._hwnd, 0)
+                self.assertTrue(win_tray.signal_existing_instance(cls_name))
+                for _ in range(30):
+                    if woke:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(woke, [1])
+            finally:
+                tray.stop()
+
+            with tempfile.TemporaryDirectory() as tmp:
+                res = win_tray.install_start_menu_shortcut(
+                    shortcut_name="KissShotUnitTest",
+                    arguments="-m kiss_shot panel",
+                    working_dir=tmp,
+                    icon_path=ico,
+                    app_id=panel_mod.APP_USER_MODEL_ID,
+                    description="Kiss-Shot unit test shortcut",
+                    target_dir=tmp,
+                )
+                self.assertTrue(res["ok"])
+                self.assertTrue(Path(str(res["path"])).is_file())
+                rem = win_tray.remove_start_menu_shortcut("KissShotUnitTest", target_dir=tmp)
+                self.assertTrue(rem["ok"])
+                self.assertTrue(rem["removed"])
+        self.assertTrue(hasattr(cli_mod, "_cmd_shortcut"))
 
     def test_zero_personal_paths_or_private_fingerprints(self) -> None:
         repo_root = Path(__file__).resolve().parent.parent

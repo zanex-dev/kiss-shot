@@ -31,8 +31,34 @@ from .remote_gateway import RemoteGatewayContext, make_gateway_handler
 def _cmd_panel(args: argparse.Namespace) -> int:
     from .panel import run_panel
 
-    run_panel(work_dir=args.work_dir, port=args.port)
+    run_panel(
+        work_dir=args.work_dir,
+        port=args.port,
+        start_minimized=bool(getattr(args, "minimized", False)),
+    )
     return 0
+
+
+def _cmd_shortcut(args: argparse.Namespace) -> int:
+    from pathlib import Path
+    from .panel import APP_USER_MODEL_ID, _get_icon_path
+    from .win_tray import install_start_menu_shortcut, remove_start_menu_shortcut
+
+    shortcut_title = "Kiss-Shot (姬丝秀忒)"
+    repo_root = Path(__file__).resolve().parent.parent
+    if getattr(args, "remove", False):
+        res = remove_start_menu_shortcut(shortcut_title)
+    else:
+        res = install_start_menu_shortcut(
+            shortcut_name=shortcut_title,
+            arguments="-m kiss_shot panel",
+            working_dir=args.work_dir or repo_root,
+            icon_path=_get_icon_path(),
+            app_id=APP_USER_MODEL_ID,
+            description="Kiss-Shot · Zero-Trust E2EE Inference Bridge & Ephemeral Ciphertext Mailbox",
+        )
+    print(f"[Kiss-Shot] {res.get('message')}")
+    return 0 if res.get("ok") else 1
 
 
 def _cmd_bridge(args: argparse.Namespace) -> int:
@@ -112,7 +138,13 @@ def main(argv: list[str] | None = None) -> int:
     p_panel = sub.add_parser("panel", help="Launch local desktop GUI console")
     p_panel.add_argument("--port", type=int, default=DEFAULT_LOCAL_PORT, help="Local OpenAI proxy port")
     p_panel.add_argument("--work-dir", default=None, help="Working directory for local config and outputs")
+    p_panel.add_argument("--minimized", action="store_true", help="Start minimized in Windows system tray")
     p_panel.set_defaults(func=_cmd_panel)
+
+    p_sc = sub.add_parser("shortcut", help="Register or remove Windows Start Menu & Taskbar-pinnable shortcut")
+    p_sc.add_argument("--work-dir", default=None, help="Optional working directory for shortcut")
+    p_sc.add_argument("--remove", action="store_true", help="Remove registered Start Menu shortcut")
+    p_sc.set_defaults(func=_cmd_shortcut)
 
     p_bridge = sub.add_parser("bridge", help="Run headless local OpenAI E2EE proxy")
     p_bridge.add_argument("--port", type=int, default=DEFAULT_LOCAL_PORT, help="Local listen port (127.0.0.1)")

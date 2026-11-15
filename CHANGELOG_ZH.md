@@ -6,6 +6,16 @@
 
 日志格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本 2.0.0 (SemVer)](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-11-15 — 专属家徽图标、原生系统托盘网桥保活与开始菜单集成
+
+### 新增
+- **官方矢量家徽与多尺寸高清图标（`assets/logo.svg` & `assets/app.ico`）**：
+  - 绘制与三部曲视觉规格对齐的 `256×256` 黑曜石鎏金绯红矢量标（哥特玫瑰窗 AEAD 密文环 + 鎏金冠冕 + 竖瞳密钥盾芯），并内置 9 档尺寸（`16px`–`256px`）高清透明 `.ico` 图标。
+- **零依赖原生 Win32 系统托盘常驻与隧道保活（`kiss_shot/win_tray.py` & `kiss_shot/panel.py`）**：
+  - Windows 下点击控制台右上角 `×` 自动转入右下角托盘静默休眠（挂起 UI 轮询实现 `0% CPU` 待机），同时持续保活 `127.0.0.1:18443/v1` 本地 AEAD 加密网桥与剪贴板票据监听，彻底消除误关窗口断连痛点；补齐高分屏 DPI 自适应、单实例前置唤醒、`--minimized` 静默启动与托盘右键快捷菜单（复制端点、拉取阅后即焚信箱、擦除剪贴板、彻底退出）。
+- **Windows 开始菜单与任务栏独立身份注册（`kiss-shot shortcut`）**：
+  - 绑定显式 `AppUserModelID`（`Trinity.KissShot.Panel`），并基于纯 `ctypes` COM 接口新增 `kiss-shot shortcut [--remove]` 命令，一键注册无黑框 `pythonw.exe` 开始菜单与任务栏可固定快捷方式（`12/12` 安全与脱敏测试全绿）。
+
 ## [1.0.0] - 2026-11-15 — 代号：`Kiss-Shot (姬丝秀忒)` · 正式版协议契约冻结
 
 ### 正式版晋升与契约锁定

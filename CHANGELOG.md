@@ -6,6 +6,16 @@ All notable changes to **`kiss-shot`** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-15 — Crest Artwork, Native System Tray Bridge Keep-Alive & Start Menu Integration
+
+### Added
+- **Official Vector Crest & Multi-Size Desktop Icon (`assets/logo.svg` & `assets/app.ico`)**:
+  - Designed the official `256×256` Obsidian/Gold/Crimson **Kiss-Shot** crest (`logo.svg`) and bundled a 9-scale (`16px`–`256px`) RGBA `.ico` icon aligned with the Trinity visual family.
+- **Zero-Dependency Win32 System Tray Bridge Keep-Alive (`kiss_shot/win_tray.py` & `kiss_shot/panel.py`)**:
+  - Closing the desktop GUI (`×`) on Windows now minimizes cleanly into the system tray (`0%` idle UI CPU) while keeping the `127.0.0.1:18443/v1` AEAD bridge and clipboard ticket watcher continuously online; added `--minimized` startup flag, High-DPI scaling, cross-instance foreground wakeup, and right-click tray actions (copy endpoint, pull & burn mailbox, scrub clipboard, exit).
+- **Windows Start Menu & Taskbar AppUserModelID Registration (`kiss-shot shortcut`)**:
+  - Bound `SetCurrentProcessExplicitAppUserModelID` (`Trinity.KissShot.Panel`) and added pure-`ctypes` COM (`IShellLinkW` + `IPropertyStore` `PKEY_AppUserModel_ID`) `kiss-shot shortcut [--remove]` command for console-free `pythonw.exe` Start Menu & Taskbar pinning (`12/12` automated security & hygiene tests passing).
+
 ## [1.0.0] - 2026-11-15 — Codename: `Kiss-Shot (姬丝秀忒)` · Stable Protocol Freeze
 
 ### Changed & Promoted

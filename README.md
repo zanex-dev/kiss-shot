@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="#verification--test-suite"><img src="https://img.shields.io/badge/tests-11%2F11%20passing-brightgreen" alt="CI" /></a>
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-v1.0.0-be123c" alt="Version v1.0.0" /></a>
+  <a href="#verification--test-suite"><img src="https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen" alt="CI" /></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-v1.1.0-be123c" alt="Version v1.1.0" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-e11d48.svg" alt="License: MIT" /></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB.svg" alt="Python 3.10+" /></a>
   <img src="https://img.shields.io/badge/codename-Kiss--Shot%20(%E5%A7%AC%E4%B8%9D%E7%A7%80%E5%BF%92)-9f1239" alt="Codename" />
@@ -104,8 +104,10 @@ Enter your session passphrase when prompted, then copy the printed `KISSSHOT_TIC
 **On your local workstation**:
 
 ```bash
-# Option A: Launch the cross-platform desktop GUI console
+# Option A: Launch the cross-platform desktop GUI console (closes to Windows system tray to keep bridge alive)
 kiss-shot panel
+kiss-shot panel --minimized   # Optional: start directly in the Windows system tray
+kiss-shot shortcut            # Optional (Windows): register Start Menu & Taskbar-pinnable app shortcut
 
 # Option B: Run the headless CLI OpenAI proxy (auto-detects KISSSHOT_TICKET from clipboard)
 kiss-shot bridge --port 18443

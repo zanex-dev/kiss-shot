@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <a href="#3-运行完整安全验证测试套件"><img src="https://img.shields.io/badge/tests-11%2F11%20passing-brightgreen" alt="CI" /></a>
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-v1.0.0-be123c" alt="Version v1.0.0" /></a>
+  <a href="#3-运行完整安全验证测试套件"><img src="https://img.shields.io/badge/tests-12%2F12%20passing-brightgreen" alt="CI" /></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-v1.1.0-be123c" alt="Version v1.1.0" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-e11d48.svg" alt="License: MIT" /></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB.svg" alt="Python 3.10+" /></a>
   <img src="https://img.shields.io/badge/codename-Kiss--Shot%20(%E5%A7%AC%E4%B8%9D%E7%A7%80%E5%BF%92)-9f1239" alt="Codename" />
@@ -61,8 +61,9 @@ kiss-shot remote-gateway \
 **在本地电脑**：
 
 ```bash
-# 方式 A：启动跨平台桌面图形控制台（支持剪贴板自动捕获票据秒连 + 异步密文信箱）
+# 方式 A：启动跨平台桌面图形控制台（点 × 自动缩入右下角托盘保活加密网桥，支持 --minimized 静默启动）
 kiss-shot panel
+kiss-shot shortcut   # 可选（Windows）：一键注册开始菜单与任务栏独立图标快捷方式（附加 --remove 可移除）
 
 # 方式 B：启动纯命令行无头加密代理
 kiss-shot bridge --port 18443
