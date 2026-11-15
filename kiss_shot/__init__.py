@@ -28,7 +28,7 @@ from .crypto import (
     unpack_encrypted_zip,
 )
 
-__version__ = "0.2.0"
+__version__ = "1.0.0"
 __all__ = [
     "__version__",
     "AAD_ARCHIVE",

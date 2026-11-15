@@ -10,14 +10,14 @@
 
 <p align="center">
   <a href="#verification--test-suite"><img src="https://img.shields.io/badge/tests-11%2F11%20passing-brightgreen" alt="CI" /></a>
-  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-v0.2.0-be123c" alt="Version v0.2.0" /></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-v1.0.0-be123c" alt="Version v1.0.0" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-e11d48.svg" alt="License: MIT" /></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB.svg" alt="Python 3.10+" /></a>
   <img src="https://img.shields.io/badge/codename-Kiss--Shot%20(%E5%A7%AC%E4%B8%9D%E7%A7%80%E5%BF%92)-9f1239" alt="Codename" />
 </p>
 
 <p align="center">
-  <a href="README.md"><strong>English</strong></a> · <a href="README_ZH.md"><strong>简体中文</strong></a>
+  <a href="README.md"><strong>English</strong></a> · <a href="README_ZH.md"><strong>简体中文</strong></a> · <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 ---

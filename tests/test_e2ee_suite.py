@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-端到端密码学、域分离 AEAD、反压缩炸弹、DNS Rebinding 防御、HTTP/SSE 环回网关与仓库脱敏测试套件 (v0.2.0)
+端到端密码学、域分离 AEAD、反压缩炸弹、DNS Rebinding 防御、HTTP/SSE 环回网关与仓库脱敏测试套件 (v1.0.0)
 运行方式: python -m unittest discover -s tests -v
 """
 
@@ -464,6 +464,9 @@ class TestEndToEndBridgeAndSecurityDefenses(unittest.TestCase):
 
 class TestRepositoryHygieneAndIsolation(unittest.TestCase):
     def test_notebooks_ast_valid(self) -> None:
+        import kiss_shot
+
+        self.assertEqual(kiss_shot.__version__, "1.0.0")
         repo_root = Path(__file__).resolve().parent.parent
         for nb_path in (repo_root / "notebooks").glob("*.ipynb"):
             nb = json.loads(nb_path.read_text(encoding="utf-8"))

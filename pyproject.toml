@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kiss-shot"
-version = "0.2.0"
+version = "1.0.0"
 description = "Zero-Trust End-to-End Encrypted (AES-256-GCM) OpenAI Inference Bridge & Ephemeral Ciphertext Mailbox for Remote GPUs. Codename: Kiss-Shot (姬丝秀忒)."
 readme = "README.md"
 license = { text = "MIT" }
@@ -23,7 +23,7 @@ keywords = [
     "privacy"
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
@@ -39,6 +39,12 @@ dependencies = [
     "pyzipper>=0.3.6",
     "huggingface_hub>=0.24.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/zanex-dev/kiss-shot"
+Repository = "https://github.com/zanex-dev/kiss-shot"
+Issues = "https://github.com/zanex-dev/kiss-shot/issues"
+Changelog = "https://github.com/zanex-dev/kiss-shot/blob/main/CHANGELOG.md"
 
 [project.scripts]
 kiss-shot = "kiss_shot.__main__:main"
