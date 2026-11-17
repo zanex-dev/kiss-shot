@@ -28,17 +28,26 @@ import pyzipper
 from kiss_shot.crypto import (
     AAD_ARCHIVE,
     AAD_BLOB,
+    AAD_QUEUE,
     aead_open,
     aead_seal,
     create_handshake_ticket,
     decrypt_bytes_aes,
     decrypt_payload_hex,
+    decrypt_queue_job,
     derive_session_cipher,
     encrypt_bytes_aes,
     encrypt_payload_hex,
+    encrypt_queue_job,
+    get_merged_llm_presets,
+    get_merged_media_presets,
     load_encrypted_secrets,
+    load_gallery_vault,
+    migrate_output_vault,
     pack_encrypted_zip,
     parse_handshake_ticket,
+    parse_hf_repo_id,
+    record_gallery_items,
     save_encrypted_secrets,
     unpack_encrypted_zip,
 )
@@ -151,6 +160,15 @@ class TestCryptoPrimitivesAndVault(unittest.TestCase):
             loaded = load_encrypted_secrets(vault_path)
             self.assertEqual(loaded, sample)
 
+            # 跨平台校验 posix_0600_v2 信封反序列化路径
+            import base64
+            posix_path = os.path.join(tmpd, ".kissshot_posix_test.json")
+            Path(posix_path).write_text(
+                json.dumps({"_vault": "posix_0600_v2", "blob": base64.b64encode(json.dumps(sample).encode("utf-8")).decode("ascii")}),
+                encoding="utf-8",
+            )
+            self.assertEqual(load_encrypted_secrets(posix_path), sample)
+
     def test_binary_aes_roundtrip(self) -> None:
         pwd = "binary-blob-secret-key"
         raw = secrets.token_bytes(8192)
@@ -233,6 +251,113 @@ class TestCryptoPrimitivesAndVault(unittest.TestCase):
         forged_task_hex = encrypt_payload_hex({"type": "kissshot_handshake", "url": "https://x.example.com", "route": "/v1/a", "salt": s1.hex()}, pwd)
         with self.assertRaises(InvalidTag):
             parse_handshake_ticket(forged_task_hex, pwd)
+
+    def test_queue_job_aead_ttl_and_domain_separation(self) -> None:
+        pwd = "queue-daemon-passphrase-2026"
+        job = {"type": "kissshot_media_infer", "preset_key": "moss_image_sft", "prompt": "机密空间构图指令", "seed": 7}
+        wire = encrypt_queue_job(job, pwd)
+        self.assertNotIn(b"kissshot_media_infer", wire)
+        self.assertEqual(decrypt_queue_job(wire, pwd), job)
+
+        # 过期队列任务必须被拒绝
+        stale_wire = encrypt_queue_job(job, pwd, issued_at=int(time.time()) - 95_000)
+        with self.assertRaises(ValueError):
+            decrypt_queue_job(stale_wire, pwd)
+
+        # 跨通道密文嫁接（AAD_BLOB -> AAD_QUEUE 或 AAD_QUEUE -> AAD_BLOB）必须触发认证失败
+        forged_blob = encrypt_bytes_aes(json.dumps({"_ks_v": 2, "_ks_iat": int(time.time()), "d": job}).encode("utf-8"), pwd, aad=AAD_BLOB)
+        with self.assertRaises(InvalidTag):
+            decrypt_queue_job(forged_blob, pwd)
+        with self.assertRaises(InvalidTag):
+            decrypt_bytes_aes(wire, pwd, aad=AAD_BLOB)
+        self.assertNotEqual(AAD_QUEUE, AAD_BLOB)
+
+    def test_gallery_vault_and_lossless_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as src_d, tempfile.TemporaryDirectory() as dst_d:
+            p1 = os.path.join(src_d, "ks_01.png")
+            p2 = os.path.join(src_d, "ks_02.png")
+            Path(p1).write_bytes(b"img-a")
+            Path(p2).write_bytes(b"img-b")
+            # 在目标目录预先放一个同名文件验证防覆盖自动重映射 (_m1)
+            Path(os.path.join(dst_d, "ks_01.png")).write_bytes(b"existing-dst")
+
+            record_gallery_items(
+                src_d,
+                [p1, p2],
+                {"seed": 100, "model": "moss_image_sft", "prompt": "TopSecretRecipePrompt"},
+            )
+            raw_vault = (Path(src_d) / ".kissshot_gallery_vault.json").read_text(encoding="utf-8")
+            self.assertNotIn("TopSecretRecipePrompt", raw_vault)
+
+            src_loaded = load_gallery_vault(src_d)
+            self.assertEqual(src_loaded["ks_01.png"]["seed"], 100)
+            self.assertEqual(src_loaded["ks_02.png"]["seed"], 101)
+
+            moved = migrate_output_vault(src_d, dst_d)
+            self.assertEqual(moved, 2)
+            self.assertFalse(os.path.exists(src_d))
+            self.assertEqual(Path(os.path.join(dst_d, "ks_01.png")).read_bytes(), b"existing-dst")
+            self.assertEqual(Path(os.path.join(dst_d, "ks_01_m1.png")).read_bytes(), b"img-a")
+            self.assertEqual(Path(os.path.join(dst_d, "ks_02.png")).read_bytes(), b"img-b")
+
+            dst_loaded = load_gallery_vault(dst_d)
+            self.assertEqual(dst_loaded["ks_01_m1.png"]["prompt"], "TopSecretRecipePrompt")
+            self.assertEqual(dst_loaded["ks_02.png"]["seed"], 101)
+
+    def test_studio_widgets_moss_layout_and_mask_helpers(self) -> None:
+        from PIL import Image, ImageDraw
+        from kiss_shot.studio_widgets import (
+            canvas_pt_to_centered,
+            centered_pt_to_canvas,
+            compile_moss_layout_json,
+            parse_moss_layout_json,
+            render_binary_mask_png,
+        )
+
+        cx, cy = canvas_pt_to_centered(250, 250, 500, 500, 1024, 1024)
+        self.assertEqual((cx, cy), (0, 0))
+        rx, ry = centered_pt_to_canvas(0, 0, 500, 500, 1024, 1024)
+        self.assertEqual((rx, ry), (250, 250))
+
+        compiled = compile_moss_layout_json(
+            "清晨玻璃温室海报",
+            [
+                {"label": "object", "caption": "热带植物玻璃穹顶", "bbox": [-400, -300, 200, 300]},
+                {"label": "text", "caption": "顶部双语主标题", "text": "KISS-SHOT", "bbox": [-600, -400, -450, 400]},
+            ],
+        )
+        obj = json.loads(compiled)
+        self.assertEqual(obj["bbox_coord_space"], "abs_centralized")
+        self.assertEqual(obj["bbox_format"], "yxyx")
+        self.assertEqual(obj["summary"]["meta"], ["poster"])
+        summary_back, boxes_back = parse_moss_layout_json(compiled)
+        self.assertEqual(summary_back, "清晨玻璃温室海报")
+        self.assertEqual(len(boxes_back), 2)
+        self.assertEqual(boxes_back[1]["text"], "KISS-SHOT")
+
+        blank = Image.new("L", (128, 128), 0)
+        self.assertIsNone(render_binary_mask_png(blank))
+        painted = Image.new("L", (128, 128), 0)
+        ImageDraw.Draw(painted).rectangle([20, 20, 60, 60], fill=255)
+        mask_png = render_binary_mask_png(painted)
+        self.assertIsNotNone(mask_png)
+        enc_mask = encrypt_bytes_aes(mask_png or b"", "mask-pass")
+        dec_img = Image.open(io.BytesIO(decrypt_bytes_aes(enc_mask, "mask-pass"))).convert("L")
+        self.assertEqual(dec_img.getpixel((40, 40)), 255)
+        self.assertEqual(dec_img.getpixel((5, 5)), 0)
+
+    def test_custom_hf_repo_parsing_and_preset_merging(self) -> None:
+        self.assertEqual(
+            parse_hf_repo_id("https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT/tree/main?tab=files"),
+            "OpenMOSS-Team/MOSS-Image-SFT",
+        )
+        with self.assertRaises(ValueError):
+            parse_hf_repo_id("invalid_single_segment")
+
+        merged_m = get_merged_media_presets([{"src_repo": "black-forest-labs/FLUX.1-dev", "arch": "flux", "note": "Dev"}])
+        self.assertTrue(any(v.get("src_repo") == "black-forest-labs/FLUX.1-dev" for v in merged_m.values()))
+        merged_l = get_merged_llm_presets([{"src_repo": "bartowski/Qwen2.5-14B-Instruct-GGUF", "src_file": "Qwen2.5-14B-Q4_K_M.gguf"}])
+        self.assertTrue(any(v.get("src_file") == "Qwen2.5-14B-Q4_K_M.gguf" for v in merged_l.values()))
 
 
 class TestEndToEndBridgeAndSecurityDefenses(unittest.TestCase):
@@ -466,7 +591,7 @@ class TestRepositoryHygieneAndIsolation(unittest.TestCase):
     def test_notebooks_ast_valid(self) -> None:
         import kiss_shot
 
-        self.assertEqual(kiss_shot.__version__, "1.1.0")
+        self.assertEqual(kiss_shot.__version__, "1.2.0")
         repo_root = Path(__file__).resolve().parent.parent
         for nb_path in (repo_root / "notebooks").glob("*.ipynb"):
             nb = json.loads(nb_path.read_text(encoding="utf-8"))
@@ -537,7 +662,10 @@ class TestRepositoryHygieneAndIsolation(unittest.TestCase):
             "edge_" + "connector",
             "try" + "cloudflare",
             "vis-lab-" + "2d",
+            "vis-lab-" + "ext",
             "nlp-lab-" + "72b",
+            "nlp-lab-" + "ext",
+            "KissShot-" + "Vault",
             "here" + "tic",
         ]
         checked_files = 0

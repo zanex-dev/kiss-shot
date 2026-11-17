@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kiss-shot"
-version = "1.1.0"
+version = "1.2.0"
 description = "Zero-Trust End-to-End Encrypted (AES-256-GCM) OpenAI Inference Bridge & Ephemeral Ciphertext Mailbox for Remote GPUs. Codename: Kiss-Shot (姬丝秀忒)."
 readme = "README.md"
 license = { text = "MIT" }
@@ -38,6 +38,7 @@ dependencies = [
     "cryptography>=42.0.0",
     "pyzipper>=0.3.6",
     "huggingface_hub>=0.24.0",
+    "Pillow>=10.0.0",
 ]
 
 [project.urls]

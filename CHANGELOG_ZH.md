@@ -6,6 +6,26 @@
 
 日志格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本 2.0.0 (SemVer)](https://semver.org/lang/zh-CN/)。
 
+## [1.2.0] - 2026-11-17 — 双向全自动密文队列、本地离线视觉工作台与全显存推理管线升级
+
+### 新增
+- **双向全自动密文任务队列（`AAD_QUEUE` · `kiss_shot/crypto.py`、`kiss_shot/panel.py` & `notebooks/remote_media_worker.ipynb`）**：
+  - 在不破坏 `v1.0` 四域冻结契约的前提下增量引入第五独立域标签 `AAD_QUEUE`（`kissshot-queue-v2`，内置 24 小时签发时效校验），打通本地面板原子入队（`_queue/job_*.bin`）、远端 1.5s 极速轮询接单（含 90 分钟空闲自动熔断保护）、后台自动拉取解密（`_inbox/pkt_*.bin`）与单次原子提交阅后即焚，彻底告别手动复制粘贴 `TASK_HEX`。
+- **零远端 WebUI 暴露的本地离线视觉创作工作台（`kiss_shot/studio_widgets.py` & `kiss_shot/panel.py`）**：
+  - **`MaskPainterDialog`（局部重绘涂抹画板）**：纯本地 `tkinter + Pillow` 实现的半透明画笔蒙版工具（支持笔刷粗细调节、15 步撤销、反选与右键擦除），二值 PNG 蒙版经 `AAD_BLOB` 加密暂存至 `_staging/mask_*.bin` 并在远端阅后即焚。
+  - **`MossLayoutDialog`（MOSS 空间构图框画板）**：面向复旦 `OpenMOSS-Team/MOSS-Image-SFT` 的中心原点坐标系（`abs_centralized` `yxyx`）可视化拖拽拉框与双语文字排版 JSON 编译器。
+  - **`GallerySidebar` 与本地受保护配方保险箱（`.kissshot_gallery_vault.json`）**：右侧实时作品预览侧边栏，采用 Windows `DPAPI` / POSIX `0600` 在本机静态保护每件产物的完整配方（`Seed`、提示词、模型与分辨率），支持一键复刻参数与 Seed、一键载入垫图/局部重绘、一键设为图生视频首帧，以及自定义产物目录时的历史文件与加密索引无损迁移（`migrate_output_vault`）。
+- **自定义 HuggingFace 仓库自动探测与主流开源预设扩充（`kiss_shot/crypto.py` & `kiss_shot/panel.py`）**：
+  - 新增 `MOSS-Image-SFT`、`HunyuanVideo-1.5 720P T2V`、`Wan 2.2 I2V A14B MoE` 标准预设，并提供自定义 `owner/repo` 自动结构探测器（自动识别 Diffusers `_class_name` 管线架构或 `.gguf` / `mmproj` 权重列表）。
+- **TorchAO 动态硬件加速与显存内分块 `2x` 超分（`notebooks/remote_media_worker.ipynb`）**：
+  - 新增 `TorchAO` `FP8 TensorCore` / `8-bit` 流式常驻显存调度与纯内存分块 `RealESRGAN_x2` 无损放大（`512px` 分块 + `32px` 重叠融合，峰值额外显存 `< 0.8 GB`）。
+
+### 修复
+- **远端加密参考图（`Img2Img` / `Inpainting` / `I2V`）全链路推理闭环（`notebooks/remote_media_worker.ipynb`）**：
+  - 修复此前版本解密 `_staging/ref_*.bin` 后未实际送入推理管线的问题，完整打通 `MOSS` 原生潜空间重绘、通用 Diffusers 垫图/高斯羽化局部重绘，以及 `Wan 2.2 I2V` / `CogVideoX I2V` 自适应比例图生视频。
+- **无控制台 `pythonw.exe` 空标准流守护补丁（`kiss_shot/panel.py`）**：
+  - 为 `sys.stdout` / `sys.stderr` 为 `None` 的后台托盘场景注入 `os.devnull` 兜底并静默进度条，消除 `pythonw.exe` 下传输大文件时的空流写入异常（`16/16` 自动化测试全绿）。
+
 ## [1.1.0] - 2026-11-15 — 专属家徽图标、原生系统托盘网桥保活与开始菜单集成
 
 ### 新增

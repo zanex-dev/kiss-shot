@@ -5,13 +5,14 @@
 核心安全特性：
 1. 密钥派生：遵循 OWASP 推荐标准，采用 PBKDF2-HMAC-SHA256 (210,000 次迭代) + 128-bit 随机盐。
 2. 密码学域分离 (Domain Separation) 与 TTL 防重放：
-   指令载荷 (AAD_PAYLOAD)、握手票据 (AAD_TICKET)、二进制附件 (AAD_BLOB) 与加密归档外层信封 (AAD_ARCHIVE)
-   各自绑定独立 AAD 标签，阻断同口令跨通道密文嫁接；结构化载荷内置签发时间戳校验（默认 24h 过期）。
+   指令载荷 (AAD_PAYLOAD)、异步队列任务 (AAD_QUEUE)、握手票据 (AAD_TICKET)、二进制附件 (AAD_BLOB)
+   与加密归档外层信封 (AAD_ARCHIVE) 各自绑定独立 AAD 标签，阻断同口令跨通道密文嫁接；
+   结构化载荷与队列任务内置签发时间戳校验（默认 24h 过期）。
 3. 流式会话隔离：每次启动远程网关自动生成随机 128-bit 会话盐与动态路径 (/v1/ks-<random>)，
    封装于 KISSSHOT_TICKET:... 握手票据中，消除固定路由与固定会话密钥特征。
 4. 双层 AEAD 归档与反压缩炸弹：异步产物在内存中采用 256-bit WinZip AES (WZ_AES) + ZIP_STORED 无压缩封装，
    外层再施加完整 AES-256-GCM 整包信封抹除 ZIP 文件头；解包端强制拒绝任何压缩条目并实行流式总字节熔断。
-5. 本机凭据静态保护：Windows 下采用系统级 DPAPI (CryptProtectData) 绑定当前登录账户加密落盘；
+5. 本机凭据与画廊配方静态保护：Windows 下采用系统级 DPAPI (CryptProtectData) 绑定当前登录账户加密落盘；
    Linux/macOS 下采用原子写入与严格 0600 属主读写权限隔离。
 """
 
@@ -23,6 +24,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sys
 import tempfile
 import time
@@ -39,6 +41,7 @@ NONCE_BYTES = 12
 AEAD_TAG_BYTES = 16
 
 AAD_PAYLOAD = b"kissshot-payload-v2"
+AAD_QUEUE = b"kissshot-queue-v2"
 AAD_TICKET = b"kissshot-ticket-v2"
 AAD_BLOB = b"kissshot-blob-v2"
 AAD_ARCHIVE = b"kissshot-archive-v2"
@@ -49,21 +52,39 @@ MAX_ARCHIVE_UNPACK_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB streaming fuse
 DEFAULT_LOCAL_PORT = 18443
 DEFAULT_MODEL_ALIAS = "kiss-shot-llm"
 DEFAULT_MAILBOX_REPO_NAME = "kissshot-ephemeral-relay"
+GALLERY_VAULT_FILENAME = ".kissshot_gallery_vault.json"
 TICKET_PREFIX = "KISSSHOT_TICKET:"
 TICKET_PATTERN = re.compile(r"KISSSHOT_TICKET:([0-9a-fA-F]{64,})")
 
 _SAFE_INNER_RE = re.compile(r"^chunk_[0-9]{3,5}\.dat$")
 _SAFE_EXT_RE = re.compile(r"^[A-Za-z0-9]{1,8}$")
+_HF_REPO_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _DPAPI_ENTROPY = b"kiss-shot-dpapi-v2"
 
 # 面向科研与开发的标准主流开源模型预设（中立合规基线）
 MEDIA_PRESETS: Dict[str, Dict[str, Any]] = {
+    "moss_image_sft": {
+        "label": "OpenMOSS MOSS-Image-SFT (5B DiT + Qwen3.5 · 空间 BBox 构图与双语文字排版)",
+        "category": "image_t2i",
+        "src_repo": "OpenMOSS-Team/MOSS-Image-SFT",
+        "arch": "moss",
+        "variant": None,
+        "skip_root_safetensors": False,
+        "default_width": 1024,
+        "default_height": 1344,
+        "default_steps": 28,
+        "default_cfg": 3.0,
+        "default_frames": 1,
+        "default_pos": "一张光影通透细腻的高清建筑与自然风景插画，清晨薄雾中的玻璃植物园，超高清细节",
+        "default_neg": "",
+    },
     "sdxl_base_1_0": {
-        "label": "Stable Diffusion XL Base 1.0 (FP16 · 1024x1024 通用文生图)",
+        "label": "Stable Diffusion XL Base 1.0 (FP16 · 1024x1024 通用文生图 / 局部重绘)",
         "category": "image_t2i",
         "src_repo": "stabilityai/stable-diffusion-xl-base-1.0",
         "arch": "sdxl",
         "variant": "fp16",
+        "skip_root_safetensors": False,
         "default_width": 1024,
         "default_height": 1024,
         "default_steps": 28,
@@ -73,11 +94,12 @@ MEDIA_PRESETS: Dict[str, Dict[str, Any]] = {
         "default_neg": "blurry, low quality, distorted, watermark, text, artifacts",
     },
     "flux_1_schnell": {
-        "label": "FLUX.1-schnell (Apache-2.0 · 4步极速高保真文生图)",
+        "label": "FLUX.1-schnell (Apache-2.0 · 4步极速高保真文生图 / 垫图微调)",
         "category": "image_t2i",
         "src_repo": "black-forest-labs/FLUX.1-schnell",
         "arch": "flux",
         "variant": None,
+        "skip_root_safetensors": False,
         "default_width": 1024,
         "default_height": 1024,
         "default_steps": 4,
@@ -92,6 +114,7 @@ MEDIA_PRESETS: Dict[str, Dict[str, Any]] = {
         "src_repo": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         "arch": "wan_t2v",
         "variant": None,
+        "skip_root_safetensors": False,
         "default_width": 832,
         "default_height": 480,
         "default_steps": 30,
@@ -101,11 +124,12 @@ MEDIA_PRESETS: Dict[str, Dict[str, Any]] = {
         "default_neg": "overexposed, static frame, blurry details, subtitles, compression artifacts",
     },
     "wan2_2_ti2v_5b": {
-        "label": "Wan 2.2 TI2V 5B (Apache-2.0 · 720P 高清文生/图生视频)",
+        "label": "Wan 2.2 TI2V 5B (Apache-2.0 · 720P 高清文生/图生视频双模)",
         "category": "video_ti2v",
         "src_repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         "arch": "wan_ti2v",
         "variant": None,
+        "skip_root_safetensors": False,
         "default_width": 1280,
         "default_height": 704,
         "default_steps": 36,
@@ -113,6 +137,127 @@ MEDIA_PRESETS: Dict[str, Dict[str, Any]] = {
         "default_frames": 81,
         "default_pos": "timelapse of ocean waves meeting basalt cliffs under golden hour clouds, crisp 720p detail",
         "default_neg": "overexposed, static, blurry, watermark, subtitles, deformed motion",
+    },
+    "hunyuan_video_1_5_t2v": {
+        "label": "HunyuanVideo-1.5 720P T2V (Qwen2.5-VL 编码 · 720P 电影级文生视频)",
+        "category": "video_t2v",
+        "src_repo": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v",
+        "arch": "hunyuan15_t2v",
+        "variant": None,
+        "skip_root_safetensors": False,
+        "default_width": 1280,
+        "default_height": 720,
+        "default_steps": 40,
+        "default_cfg": 6.0,
+        "default_frames": 81,
+        "default_pos": "cinematic documentary footage of alpine glacier stream in morning sunlight, crisp 720p motion",
+        "default_neg": "blurry, deformed motion, overexposed, flickering, subtitles, watermark",
+    },
+    "wan2_2_i2v_14b": {
+        "label": "Wan 2.2 I2V A14B MoE (Apache-2.0 · 720P 旗舰图生视频 I2V)",
+        "category": "video_i2v",
+        "src_repo": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        "arch": "wan_i2v",
+        "variant": None,
+        "skip_root_safetensors": False,
+        "default_width": 1280,
+        "default_height": 720,
+        "default_steps": 30,
+        "default_cfg": 5.0,
+        "default_frames": 81,
+        "default_pos": "natural subtle motion, gentle breeze moving foliage and reflections, smooth camera push-in",
+        "default_neg": "overexposed, static frame, blurry details, subtitles, deformed structure",
+    },
+}
+
+ARCH_PRESETS: Dict[str, Dict[str, Any]] = {
+    "moss": {
+        "label": "MOSS-Image 系生图 (OpenMOSS · 空间 BBox 构图与双语排版)",
+        "category": "image_t2i",
+        "default_width": 1024,
+        "default_height": 1344,
+        "default_steps": 28,
+        "default_cfg": 3.0,
+        "default_frames": 1,
+        "default_pos": "high-detail architectural illustration in soft morning light, clean composition",
+        "default_neg": "",
+    },
+    "sdxl": {
+        "label": "SDXL 生图 (Diffusers 或单文件 .safetensors)",
+        "category": "image_t2i",
+        "default_width": 1024,
+        "default_height": 1024,
+        "default_steps": 28,
+        "default_cfg": 5.5,
+        "default_frames": 1,
+        "default_pos": "cinematic landscape photography, crisp details, 8k resolution",
+        "default_neg": "blurry, low quality, distorted, watermark, artifacts",
+    },
+    "flux": {
+        "label": "FLUX 系生图 (FLUX.1-schnell / dev / Diffusers 衍生仓库)",
+        "category": "image_t2i",
+        "default_width": 1024,
+        "default_height": 1024,
+        "default_steps": 24,
+        "default_cfg": 3.5,
+        "default_frames": 1,
+        "default_pos": "minimalist studio design photography, natural rim lighting, ultra detailed",
+        "default_neg": "",
+    },
+    "wan_t2v": {
+        "label": "Wan 2.1 / 2.2 文生视频 (T2V Diffusers)",
+        "category": "video_t2v",
+        "default_width": 1280,
+        "default_height": 704,
+        "default_steps": 34,
+        "default_cfg": 5.0,
+        "default_frames": 81,
+        "default_pos": "smooth aerial camera motion over mountain valley at sunrise, natural lighting",
+        "default_neg": "overexposed, static, blurry, subtitles, compression artifacts",
+    },
+    "wan_i2v": {
+        "label": "Wan 2.1 / 2.2 图生视频 (I2V Diffusers)",
+        "category": "video_i2v",
+        "default_width": 1280,
+        "default_height": 720,
+        "default_steps": 30,
+        "default_cfg": 5.0,
+        "default_frames": 81,
+        "default_pos": "gentle natural camera motion, subtle atmospheric movement, crisp detail",
+        "default_neg": "overexposed, static, blurry, deformed structure, watermark",
+    },
+    "cogvideox_i2v": {
+        "label": "CogVideoX 图生视频 (CogVideoX-5B-I2V Diffusers)",
+        "category": "video_i2v",
+        "default_width": 1280,
+        "default_height": 720,
+        "default_steps": 40,
+        "default_cfg": 6.0,
+        "default_frames": 49,
+        "default_pos": "smooth animated motion, gentle breeze, clean lines, steady camera push-in",
+        "default_neg": "blurry, flickering, ghosting, deformed shapes, static",
+    },
+    "hunyuan15_t2v": {
+        "label": "HunyuanVideo 1.5 文生视频 (720P T2V Diffusers)",
+        "category": "video_t2v",
+        "default_width": 1280,
+        "default_height": 720,
+        "default_steps": 40,
+        "default_cfg": 6.0,
+        "default_frames": 81,
+        "default_pos": "cinematic natural scenery in soft golden light, smooth camera movement, 720p",
+        "default_neg": "blurry, flickering, overexposed, watermark, subtitles",
+    },
+    "auto": {
+        "label": "通用 Diffusers 自动识别管线 (DiffusionPipeline)",
+        "category": "image_t2i",
+        "default_width": 1024,
+        "default_height": 1024,
+        "default_steps": 28,
+        "default_cfg": 5.0,
+        "default_frames": 1,
+        "default_pos": "high quality detailed digital illustration, soft lighting",
+        "default_neg": "low quality, blurry, artifacts",
     },
 }
 
@@ -145,6 +290,101 @@ LLM_PRESETS: Dict[str, Dict[str, Any]] = {
         "default_img_tokens": 0,
     },
 }
+
+
+def parse_hf_repo_id(raw: str) -> str:
+    """支持直接输入 'author/model' 或完整 HuggingFace URL，清洗并校验为标准 repo_id"""
+    s = (raw or "").strip()
+    s = re.sub(r"^https?://(?:www\.)?(?:huggingface\.co|hf\.co)/", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^models/", "", s, flags=re.IGNORECASE)
+    s = s.split("?", 1)[0].split("#", 1)[0].strip("/")
+    parts = [p for p in s.split("/") if p]
+    if len(parts) >= 2:
+        candidate = f"{parts[0]}/{parts[1]}"
+        if _HF_REPO_ID_RE.fullmatch(candidate) and ".." not in candidate:
+            return candidate
+    raise ValueError("Invalid HuggingFace repository ID (expected 'owner/repo' or full https://huggingface.co/owner/repo URL)")
+
+
+def build_custom_media_entry(item: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """将持久化的自定义生图/视频模型记录标准化为 MEDIA_PRESETS 兼容条目"""
+    src_repo = parse_hf_repo_id(str(item["src_repo"]))
+    arch = str(item.get("arch") or "sdxl").strip()
+    if arch not in ARCH_PRESETS:
+        arch = "auto"
+    preset = ARCH_PRESETS[arch]
+    key = str(item.get("key") or f"custom_{re.sub(r'[^a-z0-9]+', '_', src_repo.lower()).strip('_')[:40]}")
+    if not key.startswith("custom_"):
+        key = f"custom_{key}"
+    note = str(item.get("note") or "").strip()
+    disp_title = f"{note} ({src_repo})" if note else src_repo
+    entry: Dict[str, Any] = {
+        "label": f"[自定义 · {arch.upper()}] {disp_title}",
+        "category": preset["category"],
+        "src_repo": src_repo,
+        "arch": arch,
+        "variant": item.get("variant") or None,
+        "skip_root_safetensors": bool(item.get("skip_root_safetensors", False)),
+        "default_width": int(item.get("default_width", preset["default_width"])),
+        "default_height": int(item.get("default_height", preset["default_height"])),
+        "default_steps": int(item.get("default_steps", preset["default_steps"])),
+        "default_cfg": float(item.get("default_cfg", preset["default_cfg"])),
+        "default_frames": int(item.get("default_frames", preset["default_frames"])),
+        "default_pos": str(item.get("default_pos", preset["default_pos"])),
+        "default_neg": str(item.get("default_neg", preset["default_neg"])),
+        "is_custom": True,
+    }
+    return key, entry
+
+
+def get_merged_media_presets(custom_models: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = dict(MEDIA_PRESETS)
+    for raw_item in custom_models or []:
+        try:
+            k, entry = build_custom_media_entry(raw_item)
+            merged[k] = entry
+        except Exception:
+            continue
+    return merged
+
+
+def build_custom_llm_entry(item: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """将持久化的自定义 GGUF 大语言模型记录标准化为 LLM_PRESETS 兼容条目"""
+    src_repo = parse_hf_repo_id(str(item["src_repo"]))
+    src_file = str(item["src_file"]).strip().lstrip("/")
+    if not src_file or ".." in src_file:
+        raise ValueError("GGUF weight filename must not be empty")
+    mmproj_repo_raw = str(item.get("mmproj_repo") or "").strip()
+    mmproj_file = str(item.get("mmproj_file") or "").strip().lstrip("/")
+    mmproj_repo = parse_hf_repo_id(mmproj_repo_raw) if (mmproj_repo_raw and mmproj_file) else (src_repo if mmproj_file else "")
+    key = str(item.get("key") or f"custom_llm_{re.sub(r'[^a-z0-9]+', '_', (src_repo + '_' + src_file).lower()).strip('_')[:44]}")
+    if not key.startswith("custom_llm_"):
+        key = f"custom_llm_{key}"
+    mode_tag = "VLM-GGUF" if mmproj_file else "GGUF"
+    note = str(item.get("note") or "").strip()
+    disp = f"{note} · {src_file}" if note else f"{src_repo} / {src_file}"
+    entry: Dict[str, Any] = {
+        "label": f"[自定义 · {mode_tag}] {disp}",
+        "src_repo": src_repo,
+        "src_file": src_file,
+        "mmproj_repo": mmproj_repo,
+        "mmproj_file": mmproj_file,
+        "default_ctx": int(item.get("default_ctx", 16384)),
+        "default_img_tokens": int(item.get("default_img_tokens", 1280 if mmproj_file else 0)),
+        "is_custom": True,
+    }
+    return key, entry
+
+
+def get_merged_llm_presets(custom_llms: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = dict(LLM_PRESETS)
+    for raw_item in custom_llms or []:
+        try:
+            k, entry = build_custom_llm_entry(raw_item)
+            merged[k] = entry
+        except Exception:
+            continue
+    return merged
 
 
 # ==================== Cross-Platform Local Vault (DPAPI / POSIX 0600) ====================
@@ -288,6 +528,98 @@ def load_encrypted_secrets(file_path: str, defaults: Optional[Dict[str, Any]] = 
         return base
 
 
+def load_gallery_vault(out_dir: str) -> Dict[str, Dict[str, Any]]:
+    """读取本地受保护的作品画廊配方元数据表（DPAPI / POSIX 0600）"""
+    vault_p = os.path.join(os.path.abspath(out_dir), GALLERY_VAULT_FILENAME)
+    raw = load_encrypted_secrets(vault_p, {"items": {}})
+    items = raw.get("items")
+    return items if isinstance(items, dict) else {}
+
+
+def record_gallery_items(out_dir: str, paths: List[str], meta: Dict[str, Any]) -> None:
+    """将新解密落盘的作品配方 (Seed/Prompt/模型参数) 写入本地受保护画廊索引（保留最近 500 条）"""
+    if not paths:
+        return
+    abs_dir = os.path.abspath(out_dir)
+    os.makedirs(abs_dir, exist_ok=True)
+    vault_p = os.path.join(abs_dir, GALLERY_VAULT_FILENAME)
+    items = load_gallery_vault(abs_dir)
+    now_ts = int(time.time())
+    for idx, p in enumerate(paths):
+        bname = os.path.basename(p)
+        rec = dict(meta or {})
+        if isinstance(rec.get("seed"), int) and rec["seed"] >= 0 and len(paths) > 1:
+            rec["seed"] = rec["seed"] + idx
+        rec["saved_at"] = now_ts
+        items[bname] = rec
+    if len(items) > 500:
+        sorted_keys = sorted(items.keys(), key=lambda k: int(items[k].get("saved_at", 0)), reverse=True)[:500]
+        items = {k: items[k] for k in sorted_keys}
+    save_encrypted_secrets(vault_p, {"items": items})
+
+
+def migrate_output_vault(legacy_dir: str, target_dir: str) -> int:
+    """无损迁移历史解密产物与加密画廊配方索引（自动防撞名重映射并在搬空后清理旧目录）"""
+    src_abs = os.path.abspath(legacy_dir)
+    dst_abs = os.path.abspath(target_dir)
+    if os.path.normcase(src_abs) == os.path.normcase(dst_abs) or not os.path.isdir(src_abs):
+        return 0
+    entries = os.listdir(src_abs)
+    if not entries:
+        try:
+            os.rmdir(src_abs)
+        except OSError:
+            pass
+        return 0
+
+    os.makedirs(dst_abs, exist_ok=True)
+    src_vault = os.path.join(src_abs, GALLERY_VAULT_FILENAME)
+    dst_vault = os.path.join(dst_abs, GALLERY_VAULT_FILENAME)
+    legacy_items = load_gallery_vault(src_abs) if os.path.isfile(src_vault) else {}
+    name_remap: Dict[str, str] = {}
+    moved_media = 0
+
+    for name in entries:
+        if name == GALLERY_VAULT_FILENAME:
+            continue
+        sp = os.path.join(src_abs, name)
+        if not os.path.isfile(sp):
+            continue
+        stem, ext = os.path.splitext(name)
+        final_name = name
+        dp = os.path.join(dst_abs, final_name)
+        seq = 1
+        while os.path.exists(dp):
+            final_name = f"{stem}_m{seq}{ext}"
+            dp = os.path.join(dst_abs, final_name)
+            seq += 1
+        shutil.move(sp, dp)
+        name_remap[name] = final_name
+        moved_media += 1
+
+    if os.path.isfile(src_vault):
+        if legacy_items:
+            dst_items = load_gallery_vault(dst_abs) if os.path.isfile(dst_vault) else {}
+            for old_k, rec in legacy_items.items():
+                new_k = name_remap.get(old_k, old_k)
+                dst_items.setdefault(new_k, rec)
+            save_encrypted_secrets(dst_vault, {"items": dst_items})
+        elif not os.path.isfile(dst_vault):
+            shutil.move(src_vault, dst_vault)
+        if os.path.isfile(src_vault):
+            try:
+                os.remove(src_vault)
+            except OSError:
+                pass
+
+    if not os.listdir(src_abs):
+        try:
+            os.rmdir(src_abs)
+        except OSError:
+            pass
+    return moved_media
+
+
 # ==================== AEAD Primitives ====================
 def derive_key(passphrase: str, salt: bytes, iterations: int = KDF_ITERATIONS) -> bytes:
     """使用 PBKDF2-HMAC-SHA256 从用户口令与随机盐派生 256-bit 密钥"""
@@ -386,6 +718,40 @@ def decrypt_bytes_aes(
     ciphertext = enc_bytes[SALT_BYTES + NONCE_BYTES :]
     key = derive_key(passphrase, salt)
     return AESGCM(key).decrypt(nonce, ciphertext, aad)
+
+
+def encrypt_queue_job(
+    data: Dict[str, Any],
+    passphrase: str,
+    issued_at: Optional[int] = None,
+) -> bytes:
+    """封装异步密文信箱队列任务二进制密文（绑定独立 AAD_QUEUE 域标签与 24h TTL）"""
+    wrapped = {
+        "_ks_v": 2,
+        "_ks_iat": int(time.time()) if issued_at is None else int(issued_at),
+        "d": data,
+    }
+    pt = json.dumps(wrapped, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return encrypt_bytes_aes(pt, passphrase, aad=AAD_QUEUE)
+
+
+def decrypt_queue_job(
+    enc_bytes: bytes,
+    passphrase: str,
+    max_age_seconds: int = MAX_PAYLOAD_TTL_SECONDS,
+) -> Dict[str, Any]:
+    """校验 AAD_QUEUE 域分离与 24h TTL 并解封异步队列任务密文"""
+    pt = decrypt_bytes_aes(enc_bytes, passphrase, aad=AAD_QUEUE)
+    parsed = json.loads(pt.decode("utf-8"))
+    if not isinstance(parsed, dict) or parsed.get("_ks_v") != 2 or "d" not in parsed:
+        raise ValueError("Malformed queue job envelope / 队列任务信封结构异常")
+    iat = int(parsed.get("_ks_iat", 0) or 0)
+    if max_age_seconds > 0 and (not iat or abs(time.time() - iat) > max_age_seconds):
+        raise ValueError("Expired queue job / 队列任务密文已过期")
+    inner = parsed["d"]
+    if not isinstance(inner, dict):
+        raise ValueError("Malformed queue job payload")
+    return inner
 
 
 def aead_seal(cipher: AESGCM, plaintext: bytes, aad: bytes) -> bytes:

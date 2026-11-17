@@ -6,6 +6,26 @@ All notable changes to **`kiss-shot`** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-17 — Bidirectional Ciphertext Queue, Local Visual Studio & Full-VRAM Pipeline Suite
+
+### Added
+- **Bidirectional Ephemeral Ciphertext Queue (`AAD_QUEUE` · `kiss_shot/crypto.py`, `kiss_shot/panel.py` & `notebooks/remote_media_worker.ipynb`)**:
+  - Introduced domain-separated `AAD_QUEUE` (`kissshot-queue-v2`) with 24-hour authenticated TTL envelopes (`encrypt_queue_job` / `decrypt_queue_job`), enabling one-click atomic job dispatch (`_queue/job_*.bin`), remote 1.5s daemon polling (with 90-minute idle auto-stop), automatic background retrieval (`_inbox/pkt_*.bin`), and single-commit burn-after-reading without manual token copy-pasting.
+- **Zero-WebUI Local Offline Visual Studio (`kiss_shot/studio_widgets.py` & `kiss_shot/panel.py`)**:
+  - **`MaskPainterDialog`**: Local `tkinter + Pillow` semi-transparent brush canvas for `Inpainting` (brush radius slider, 15-step undo stack, mask inversion, right-click eraser), sealing binary PNG masks end-to-end under `AAD_BLOB` (`_staging/mask_*.bin`).
+  - **`MossLayoutDialog`**: Interactive centered-origin (`abs_centralized` `yxyx`) bounding-box visual composer for `OpenMOSS-Team/MOSS-Image-SFT` spatial object & bilingual typography layout JSON compilation.
+  - **`GallerySidebar` & Encrypted Recipe Vault (`.kissshot_gallery_vault.json`)**: Local thumbnail/video gallery backed by Windows `DPAPI` / POSIX `0600` at-rest encryption for generation recipes (`seed`, `prompt`, `model`, dimensions), supporting one-click Seed/recipe restoration, `Img2Img` / `Inpainting` staging, `I2V` keyframe handoff, and lossless directory migration (`migrate_output_vault`).
+- **Custom HuggingFace Repository Auto-Probing & Expanded Presets (`kiss_shot/crypto.py` & `kiss_shot/panel.py`)**:
+  - Added neutral open-source presets (`MOSS-Image-SFT`, `HunyuanVideo-1.5 720P T2V`, `Wan 2.2 I2V A14B MoE`) plus an interactive custom `owner/repo` inspector that automatically detects Diffusers `_class_name` architectures or `.gguf` / `mmproj` weights.
+- **TorchAO FP8/8-bit Streaming Residency & Tiled 2x Super-Resolution (`notebooks/remote_media_worker.ipynb`)**:
+  - Added hardware-probed `TorchAO` `FP8 TensorCore` / `8-bit` streaming VRAM placement and in-memory tiled `RealESRGAN_x2` (`512px` tiles, `32px` feather overlap, `<0.8 GB` peak extra VRAM).
+
+### Fixed
+- **Remote Reference Image (`Img2Img` / `Inpainting` / `I2V`) Execution Pipeline (`notebooks/remote_media_worker.ipynb`)**:
+  - Wired decrypted `_staging/ref_*.bin` and `_staging/mask_*.bin` inputs end-to-end into `MOSS` Rectified Flow latent blending, `AutoPipelineForImage2Image` / `AutoPipelineForInpainting` Gaussian-feathered compositing, and `WanImageToVideoPipeline` / `CogVideoXImageToVideoPipeline` aspect-aligned video synthesis.
+- **Windowless `pythonw.exe` Null Standard Stream Guard (`kiss_shot/panel.py`)**:
+  - Redirected `None` `sys.stdout` / `sys.stderr` handles to `os.devnull` and silenced background progress bars so tray-mode `huggingface_hub` transfers never raise `AttributeError` under `pythonw.exe`.
+
 ## [1.1.0] - 2026-11-15 — Crest Artwork, Native System Tray Bridge Keep-Alive & Start Menu Integration
 
 ### Added
