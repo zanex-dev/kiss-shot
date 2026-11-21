@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -127,7 +129,7 @@ MEDIA_PRESETS: Dict[str, Dict[str, Any]] = {
         "label": "Wan 2.2 TI2V 5B (Apache-2.0 · 720P 高清文生/图生视频双模)",
         "category": "video_ti2v",
         "src_repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-        "arch": "wan_ti2v",
+        "arch": "wan_ti2v_5b",
         "variant": None,
         "skip_root_safetensors": False,
         "default_width": 1280,
@@ -203,6 +205,17 @@ ARCH_PRESETS: Dict[str, Dict[str, Any]] = {
         "default_frames": 1,
         "default_pos": "minimalist studio design photography, natural rim lighting, ultra detailed",
         "default_neg": "",
+    },
+    "wan_ti2v_5b": {
+        "label": "Wan 2.2 TI2V 5B 双模视频 (T2V / I2V Diffusers · 24fps)",
+        "category": "video_ti2v",
+        "default_width": 1280,
+        "default_height": 704,
+        "default_steps": 36,
+        "default_cfg": 5.0,
+        "default_frames": 81,
+        "default_pos": "timelapse of ocean waves meeting basalt cliffs under golden hour clouds, crisp 720p detail",
+        "default_neg": "overexposed, static, blurry, watermark, subtitles, deformed motion",
     },
     "wan_t2v": {
         "label": "Wan 2.1 / 2.2 文生视频 (T2V Diffusers)",
@@ -528,22 +541,59 @@ def load_encrypted_secrets(file_path: str, defaults: Optional[Dict[str, Any]] = 
         return base
 
 
-def load_gallery_vault(out_dir: str) -> Dict[str, Dict[str, Any]]:
-    """读取本地受保护的作品画廊配方元数据表（DPAPI / POSIX 0600）"""
+def _read_encrypted_secrets_strict(file_path: str) -> Dict[str, Any]:
+    """严格读取并解密本地保险箱；文件损坏、格式异常或解密失败直接抛错，绝不静默返回空字典。"""
+    with open(file_path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict):
+        raise ValueError(f"Corrupted vault root structure in {file_path}")
+    vault_kind = obj.get("_vault")
+    if vault_kind == "dpapi_v2":
+        if sys.platform != "win32":
+            raise OSError("Cannot decrypt Windows DPAPI vault on a non-Windows platform")
+        dec = json.loads(_dpapi_open(bytes.fromhex(str(obj["blob"]))).decode("utf-8"))
+        if not isinstance(dec, dict):
+            raise ValueError(f"Corrupted decrypted DPAPI vault payload in {file_path}")
+        return dec
+    if vault_kind == "posix_0600_v2":
+        dec = json.loads(base64.b64decode(str(obj["blob"])).decode("utf-8"))
+        if not isinstance(dec, dict):
+            raise ValueError(f"Corrupted decoded POSIX vault payload in {file_path}")
+        return dec
+    if vault_kind is not None:
+        raise ValueError(f"Unsupported vault format {vault_kind!r} in {file_path}")
+    return obj
+
+
+def load_gallery_vault(out_dir: str, for_update: bool = False) -> Dict[str, Dict[str, Any]]:
+    """
+    读取本地受保护的作品画廊配方索引（DPAPI / POSIX 0600）。
+    - `for_update=True`（写入/迁移前）：若索引文件已存在但损坏、无法解密或结构异常，直接抛错拒绝覆盖写入，
+      防止把用户历史配方索引静默清空；仅在索引文件不存在时返回空字典。
+    - `for_update=False`（界面只读展示）：兼容容错返回空字典。
+    """
     vault_p = os.path.join(os.path.abspath(out_dir), GALLERY_VAULT_FILENAME)
+    if for_update:
+        if not os.path.exists(vault_p):
+            return {}
+        raw = _read_encrypted_secrets_strict(vault_p)
+        items = raw.get("items")
+        if not isinstance(items, dict):
+            raise ValueError(f"Corrupted gallery vault 'items' index in {vault_p}")
+        return items
     raw = load_encrypted_secrets(vault_p, {"items": {}})
     items = raw.get("items")
     return items if isinstance(items, dict) else {}
 
 
 def record_gallery_items(out_dir: str, paths: List[str], meta: Dict[str, Any]) -> None:
-    """将新解密落盘的作品配方 (Seed/Prompt/模型参数) 写入本地受保护画廊索引（保留最近 500 条）"""
+    """将新解密落盘的作品配方 (Seed/Prompt/模型参数) 写入本地受保护画廊索引（保留最近 500 条；坏索引拒写）"""
     if not paths:
         return
     abs_dir = os.path.abspath(out_dir)
     os.makedirs(abs_dir, exist_ok=True)
     vault_p = os.path.join(abs_dir, GALLERY_VAULT_FILENAME)
-    items = load_gallery_vault(abs_dir)
+    items = load_gallery_vault(abs_dir, for_update=True)
     now_ts = int(time.time())
     for idx, p in enumerate(paths):
         bname = os.path.basename(p)
@@ -559,7 +609,7 @@ def record_gallery_items(out_dir: str, paths: List[str], meta: Dict[str, Any]) -
 
 
 def migrate_output_vault(legacy_dir: str, target_dir: str) -> int:
-    """无损迁移历史解密产物与加密画廊配方索引（自动防撞名重映射并在搬空后清理旧目录）"""
+    """无损迁移历史解密产物与加密画廊配方索引（自动防撞名重映射、坏索引拒写并在搬空后清理旧目录）"""
     src_abs = os.path.abspath(legacy_dir)
     dst_abs = os.path.abspath(target_dir)
     if os.path.normcase(src_abs) == os.path.normcase(dst_abs) or not os.path.isdir(src_abs):
@@ -575,7 +625,8 @@ def migrate_output_vault(legacy_dir: str, target_dir: str) -> int:
     os.makedirs(dst_abs, exist_ok=True)
     src_vault = os.path.join(src_abs, GALLERY_VAULT_FILENAME)
     dst_vault = os.path.join(dst_abs, GALLERY_VAULT_FILENAME)
-    legacy_items = load_gallery_vault(src_abs) if os.path.isfile(src_vault) else {}
+    legacy_items = load_gallery_vault(src_abs, for_update=True) if os.path.isfile(src_vault) else {}
+    dst_items = load_gallery_vault(dst_abs, for_update=True) if os.path.isfile(dst_vault) else {}
     name_remap: Dict[str, str] = {}
     moved_media = 0
 
@@ -599,7 +650,6 @@ def migrate_output_vault(legacy_dir: str, target_dir: str) -> int:
 
     if os.path.isfile(src_vault):
         if legacy_items:
-            dst_items = load_gallery_vault(dst_abs) if os.path.isfile(dst_vault) else {}
             for old_k, rec in legacy_items.items():
                 new_k = name_remap.get(old_k, old_k)
                 dst_items.setdefault(new_k, rec)
@@ -873,17 +923,31 @@ def pack_encrypted_zip(
     return encrypt_bytes_aes(buf.getvalue(), passphrase, aad=AAD_ARCHIVE)
 
 
+def _file_sha256_hex(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(1024 * 1024)
+            if not buf:
+                break
+            h.update(buf)
+    return h.hexdigest()
+
+
 def unpack_encrypted_zip(
     archive_bytes: bytes,
     passphrase: str,
     out_dir: str,
     prefix: str = "artifact",
     max_total_bytes: int = MAX_ARCHIVE_UNPACK_BYTES,
+    packet_id: Optional[str] = None,
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
     校验外层 AAD_ARCHIVE 信封并安全流式解包内层 256-bit WZ_AES 归档：
     - 强制拒绝非 ZIP_STORED 压缩条目，免疫 ZIP_DEFLATED 解压炸弹攻击。
     - 1 MiB 流式分块写入 + 总字节上限熔断 + 异常半成品自动清理 + 严格路径穿越拦截。
+    - 提供 `packet_id` 时使用确定性文件名实现幂等落盘：同名且内容哈希一致直接复用不重复生成；
+      若目标文件已被用户编辑修改（哈希不一致）则拒覆并抛出 `FileExistsError`，且绝不删除已有用户文件。
     """
     os.makedirs(out_dir, exist_ok=True)
     real_out_dir = os.path.realpath(out_dir)
@@ -891,9 +955,14 @@ def unpack_encrypted_zip(
 
     pwd_bytes = passphrase.encode("utf-8")
     saved_paths: List[str] = []
+    newly_created: List[str] = []
     total_written = 0
     ts = time.strftime("%Y%m%d_%H%M%S")
     safe_prefix = re.sub(r"[^A-Za-z0-9_-]", "", prefix)[:24] or "artifact"
+    safe_pkt = ""
+    if packet_id is not None and str(packet_id).strip():
+        cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(packet_id).strip())[:40]
+        safe_pkt = cleaned if len(cleaned) >= 4 else hashlib.sha256(str(packet_id).encode("utf-8")).hexdigest()[:16]
 
     try:
         with pyzipper.AESZipFile(io.BytesIO(inner_zip), "r") as zf:
@@ -924,23 +993,51 @@ def unpack_encrypted_zip(
                 if total_written + entry_info.file_size > max_total_bytes:
                     raise ValueError("Total unpacked size exceeds safety limit")
 
-                fname = f"{safe_prefix}_{ts}_{idx + 1:02d}_{secrets.token_hex(2)}.{raw_ext}"
+                if safe_pkt:
+                    fname = f"{safe_prefix}_{safe_pkt}_{idx + 1:02d}.{raw_ext}"
+                else:
+                    fname = f"{safe_prefix}_{ts}_{idx + 1:02d}_{secrets.token_hex(2)}.{raw_ext}"
                 fpath = os.path.realpath(os.path.join(real_out_dir, fname))
                 if os.path.commonpath([real_out_dir, fpath]) != real_out_dir or fpath == real_out_dir:
                     raise ValueError("Path traversal attempt rejected")
 
-                with zf.open(inner, "r") as src_f, open(fpath, "wb") as dst_f:
-                    while True:
-                        chunk = src_f.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        total_written += len(chunk)
-                        if total_written > max_total_bytes:
-                            raise ValueError("Streamed bytes exceeded safety limit")
-                        dst_f.write(chunk)
-                saved_paths.append(fpath)
+                fd, tmp_p = tempfile.mkstemp(dir=real_out_dir, prefix=".ks_unpack_", suffix=".tmp")
+                entry_hasher = hashlib.sha256()
+                try:
+                    with zf.open(inner, "r") as src_f, os.fdopen(fd, "wb") as dst_f:
+                        while True:
+                            chunk = src_f.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            total_written += len(chunk)
+                            if total_written > max_total_bytes:
+                                raise ValueError("Streamed bytes exceeded safety limit")
+                            entry_hasher.update(chunk)
+                            dst_f.write(chunk)
+
+                    if os.path.exists(fpath):
+                        existing_hash = _file_sha256_hex(fpath)
+                        if hmac.compare_digest(existing_hash, entry_hasher.hexdigest()):
+                            os.remove(tmp_p)
+                            saved_paths.append(fpath)
+                            continue
+                        os.remove(tmp_p)
+                        raise FileExistsError(
+                            f"Refusing to overwrite modified local file during idempotent unpack: {fpath}"
+                        )
+
+                    os.replace(tmp_p, fpath)
+                    newly_created.append(fpath)
+                    saved_paths.append(fpath)
+                except Exception:
+                    if os.path.exists(tmp_p):
+                        try:
+                            os.remove(tmp_p)
+                        except OSError:
+                            pass
+                    raise
     except Exception:
-        for p in saved_paths:
+        for p in newly_created:
             if os.path.exists(p):
                 try:
                     os.remove(p)

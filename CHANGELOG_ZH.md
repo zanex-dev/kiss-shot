@@ -6,6 +6,27 @@
 
 日志格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本 2.0.0 (SemVer)](https://semver.org/lang/zh-CN/)。
 
+## [1.3.0] - 2026-11-21 — 事务级密文队列 v2、本地加密任务账本与供应链深度加固
+
+### 新增
+- **本地 SQLite WAL 加密任务账本与发件箱（`kiss_shot/job_ledger.py`）**：
+  - 持久化跨重启任务状态（`jobs`）、仅存密文的发件箱载荷（`outbox`，绝不落盘明文提示词与 `hf_token`）、结构化失败审计（`failures`）及签收/销毁回执（`receipts`），POSIX 自动收紧 `0600` 权限。
+- **事务级密文信箱 v2 条件提交与快照摘要校验（`kiss_shot/mailbox_delivery.py` & `notebooks/remote_media_worker.ipynb`）**：
+  - 引入 `_queue/v2/` 条件提交与 `parent_commit` 乐观并发控制重试（`commit_with_parent_retry` / `enqueue_job_v2`）；远端守护进程新增 `_claims/<job_id>.json` 租约抢占与后台心跳续期（`_try_claim_job` / `_ClaimHeartbeat`）及 `_finish_job` 单次原子提交（写入 `_inbox/pkt_*.bin` + `_receipts/<job_id>.json` 并清理 `_queue/`/`_claims/`/`_staging/`）；本机拉取锁定 `packet_revision` 与 `blob_id`（Git Blob SHA-1 / LFS SHA-256）防 TOCTOU 掉包，并通过 `burn_packets_conditional` 条件销毁且如实汇报实际移除分片数。
+- **可选运行时依赖锁与推理引擎二进制校验（`kiss_shot/runtime_lock.py`、`notebooks/remote_llm_gateway.ipynb` & `notebooks/remote_media_worker.ipynb`）**：
+  - 新增 `snapshot("llm" | "studio")` 与 `verify_runtime_lock(..., strict=False)`（默认兼容放行，`strict=True` 遇缺清单、漂移或 `manifest_sha256` 篡改立即熔断）；远端 LLM 网关 Notebook 新增 `verified_engine` 二进制 SHA-256 校验，监听地址默认收紧至 `127.0.0.1`。
+- **动态 LoRA 强度控制与 `packet_id` 幂等解包（`kiss_shot/crypto.py`、`kiss_shot/panel.py` & `notebooks/remote_media_worker.ipynb`）**：
+  - `unpack_encrypted_zip` 支持基于 `packet_id` 的确定性幂等落盘（哈希一致直接复用、用户已编辑文件抛 `FileExistsError` 绝不误覆）；新增 `_set_lora_strength` 动态加载/缩放/干净卸载，以及 `validate_media_batch`、`strip_queue_job_secrets`、`resolve_recipe_restore_values`、`format_burn_report` 辅助校验。
+
+### 安全加固与修复
+- **模型仓固定提交 SHA、白名单自定义代码与可执行文件剥离（`notebooks/remote_media_worker.ipynb`）**：
+  - 8 个预置 HuggingFace 模型仓全部锁定 40 位不可变 commit SHA（`PINNED_MODEL_REVISIONS`），`verified_model_file` 强制校验固定提交与 SHA-256；自定义 MOSS 管线代码仅允许 `APPROVED_MOSS_SOURCES` 白名单经 `_approved_moss_source` 校验后加载；模型仓下载全面剥离 `.py`/`.sh`/`.so`/`.exe` 等可执行脚本（`_strip_repo_executables`）。
+- **选择性 IPython 敏感历史擦除与 SillyTavern 单 profile 绑定（`notebooks/*.ipynb` & `kiss_shot/local_bridge.py`）**：
+  - 两本 Notebook 改为仅清理含 `KISSSHOT_`、`SESSION_PASSPHRASE`、`_TASK_HEX`、`_LLM_HEX` 的敏感历史行（`_scrub_sqlite_history_file`），不再误删用户无关实验记录。
+  - `bind_sillytavern_client` 强制单 profile 绑定（多 profile 未显式指定时拒写）并在首次修改前自动备份 `settings.before-kiss-shot.json`。
+- **架构路由与队列凭据收口（`notebooks/remote_media_worker.ipynb` & `kiss_shot/panel.py`）**：
+  - `_job_arch` 保留 `wan_ti2v_5b`（兼容旧版 `wan_ti2v`），队列任务自动剥离 `hf_token` 由守护进程内存凭据兜底；在不破坏五域 `kissshot-*` AAD 与 `KISSSHOT_TICKET` 冻结契约的前提下，自动化测试套件扩充至 `25/25` 全绿。
+
 ## [1.2.0] - 2026-11-17 — 双向全自动密文队列、本地离线视觉工作台与全显存推理管线升级
 
 ### 新增

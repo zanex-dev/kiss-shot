@@ -12,7 +12,18 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from typing import Optional
+
+_CLIP_LOCK = threading.Lock()
+
+
+def _expected_matches(current: str, expected: str) -> bool:
+    exp_s = expected.strip()
+    if exp_s:
+        return current.strip() == exp_s
+    return current == expected
 
 
 if sys.platform == "win32":
@@ -69,28 +80,34 @@ if sys.platform == "win32":
             _kernel32.GlobalUnlock(hmem)
         return hmem
 
+    def _read_locked_unicode_text() -> Optional[str]:
+        if not _user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            return None
+        handle = _user32.GetClipboardData(CF_UNICODETEXT)
+        if not handle:
+            return None
+        byte_len = _kernel32.GlobalSize(handle)
+        if byte_len < 2:
+            return ""
+        max_wchars = min(byte_len // 2, 1_048_576)
+        ptr = _kernel32.GlobalLock(handle)
+        if not ptr:
+            return None
+        try:
+            raw_w = ctypes.wstring_at(ptr, max_wchars)
+            nul_pos = raw_w.find("\x00")
+            return raw_w[:nul_pos] if nul_pos >= 0 else raw_w
+        finally:
+            _kernel32.GlobalUnlock(handle)
+
     def read_clipboard_text() -> str:
         if not _user32.IsClipboardFormatAvailable(CF_UNICODETEXT):
             return ""
         for _ in range(3):
             if _user32.OpenClipboard(None):
                 try:
-                    handle = _user32.GetClipboardData(CF_UNICODETEXT)
-                    if not handle:
-                        return ""
-                    byte_len = _kernel32.GlobalSize(handle)
-                    if byte_len < 2:
-                        return ""
-                    max_wchars = min(byte_len // 2, 1_048_576)
-                    ptr = _kernel32.GlobalLock(handle)
-                    if not ptr:
-                        return ""
-                    try:
-                        raw_w = ctypes.wstring_at(ptr, max_wchars)
-                        nul_pos = raw_w.find("\x00")
-                        return raw_w[:nul_pos] if nul_pos >= 0 else raw_w
-                    finally:
-                        _kernel32.GlobalUnlock(handle)
+                    txt = _read_locked_unicode_text()
+                    return txt or ""
                 finally:
                     _user32.CloseClipboard()
             time.sleep(0.02)
@@ -121,15 +138,23 @@ if sys.platform == "win32":
             time.sleep(0.02)
         return False
 
-    def clear_clipboard_text() -> None:
+    def clear_clipboard_text(expected: Optional[str] = None) -> bool:
+        """
+        清空系统剪贴板。当传入 `expected` 时，在同一 OpenClipboard 锁内原子比对当前文本，
+        仅在内容仍匹配时清空，消除读取与清空之间的 TOCTOU 误删风险。
+        """
         for _ in range(3):
             if _user32.OpenClipboard(None):
                 try:
-                    _user32.EmptyClipboard()
-                    return
+                    if expected is not None:
+                        current = _read_locked_unicode_text()
+                        if current is None or not _expected_matches(current, expected):
+                            return False
+                    return bool(_user32.EmptyClipboard())
                 finally:
                     _user32.CloseClipboard()
             time.sleep(0.02)
+        return False
 
 elif sys.platform == "darwin":
 
@@ -147,8 +172,13 @@ elif sys.platform == "darwin":
         except Exception:
             return False
 
-    def clear_clipboard_text() -> None:
-        write_clipboard_secret("")
+    def clear_clipboard_text(expected: Optional[str] = None) -> bool:
+        with _CLIP_LOCK:
+            if expected is not None:
+                current = read_clipboard_text()
+                if not _expected_matches(current, expected):
+                    return False
+            return write_clipboard_secret("")
 
 else:
 
@@ -196,5 +226,10 @@ else:
             pass
         return False
 
-    def clear_clipboard_text() -> None:
-        write_clipboard_secret("")
+    def clear_clipboard_text(expected: Optional[str] = None) -> bool:
+        with _CLIP_LOCK:
+            if expected is not None:
+                current = read_clipboard_text()
+                if not _expected_matches(current, expected):
+                    return False
+            return write_clipboard_secret("")

@@ -3,6 +3,7 @@
 .kissshot_gallery_vault.json
 .kissshot_bridge_state.json
 .kissshot_ipc.json
+.kissshot_jobs.sqlite3*
 outputs/
 
 # Python artifacts

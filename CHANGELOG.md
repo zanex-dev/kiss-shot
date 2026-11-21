@@ -6,6 +6,27 @@ All notable changes to **`kiss-shot`** will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-21 — Transactional Ciphertext Queue v2, Encrypted Job Ledger & Supply-Chain Hardening
+
+### Added
+- **Local Encrypted SQLite WAL Job Ledger & Outbox (`kiss_shot/job_ledger.py`)**:
+  - Persists cross-restart job lifecycle states (`jobs`), encrypted ciphertext outbox blobs (`outbox` — never storing plaintext prompts or `hf_token`), structured failure records (`failures`), and delivery/burn receipts (`receipts`) with `0600` POSIX permissions.
+- **Transactional Mailbox v2 CAS Delivery & Snapshot Verification (`kiss_shot/mailbox_delivery.py` & `notebooks/remote_media_worker.ipynb`)**:
+  - Introduced `_queue/v2/` dispatch with HuggingFace `parent_commit` CAS retry (`commit_with_parent_retry` / `enqueue_job_v2`), remote worker lease claiming & renewal heartbeats (`_claims/<job_id>.json`, `_try_claim_job`, `_ClaimHeartbeat`), atomic completion commits (`_finish_job` committing `_inbox/pkt_*.bin` + `_receipts/<job_id>.json` while cleaning `_queue/`/`_claims/`/`_staging/`), revision-locked `blob_id` (Git Blob SHA-1 / LFS SHA-256) download verification, and conditional burning (`burn_packets_conditional`) with accurate `removed_count` / `skipped_paths` reporting.
+- **Optional Runtime Dependency Lock & Engine Integrity Verification (`kiss_shot/runtime_lock.py`, `notebooks/remote_llm_gateway.ipynb` & `notebooks/remote_media_worker.ipynb`)**:
+  - Added `snapshot("llm" | "studio")` and `verify_runtime_lock(..., strict=False)` (compatibility-first default with strict-mode enforcement on drift or `manifest_sha256` tampering) plus `verified_engine` SHA-256 binary integrity checks and default `127.0.0.1` loopback binding in the remote LLM gateway notebook.
+- **Dynamic LoRA Strength Controls & Idempotent Unpacking (`kiss_shot/crypto.py`, `kiss_shot/panel.py` & `notebooks/remote_media_worker.ipynb`)**:
+  - Added deterministic `packet_id` idempotent unpacking in `unpack_encrypted_zip` (reusing identical existing files while refusing to overwrite user-modified files via `FileExistsError`), dynamic LoRA loading/scaling/unloading (`_set_lora_strength`), and recipe restoration helpers (`resolve_recipe_restore_values`, `validate_media_batch`, `strip_queue_job_secrets`, `format_burn_report`).
+
+### Security & Fixed
+- **Pinned Model Commits, Approved Custom Code & Executable Stripping (`notebooks/remote_media_worker.ipynb`)**:
+  - Pinned all 8 preset HuggingFace model repositories to immutable 40-character commit SHAs (`PINNED_MODEL_REVISIONS`), enforced SHA-256 digest checks via `verified_model_file`, restricted custom MOSS pipeline Python code strictly to `APPROVED_MOSS_SOURCES` (`_approved_moss_source`), and stripped executable/script files from downloaded model directories (`_strip_repo_executables`).
+- **Selective IPython History Scrubbing & Single-Profile SillyTavern Binding (`notebooks/*.ipynb` & `kiss_shot/local_bridge.py`)**:
+  - Replaced blanket history wiping with selective deletion of only `KISSSHOT_`-related sensitive rows (`_scrub_sqlite_history_file`) so unrelated user notebook history is preserved.
+  - Hardened `bind_sillytavern_client` to require an explicit single `profile` when multiple profiles exist (refusing bulk overwrites) and automatically save a one-time `settings.before-kiss-shot.json` backup before patching.
+- **Architecture & Queue Hygiene Fixes (`notebooks/remote_media_worker.ipynb` & `kiss_shot/panel.py`)**:
+  - Preserved `wan_ti2v_5b` in `_job_arch` (with backward compatibility for `wan_ti2v`), stripped `hf_token` from queued ciphertext jobs (falling back to in-memory daemon credentials), and expanded the automated verification suite to `25/25` passing tests without altering the frozen five-domain `kissshot-*` AAD or `KISSSHOT_TICKET` wire contract.
+
 ## [1.2.0] - 2026-11-17 — Bidirectional Ciphertext Queue, Local Visual Studio & Full-VRAM Pipeline Suite
 
 ### Added

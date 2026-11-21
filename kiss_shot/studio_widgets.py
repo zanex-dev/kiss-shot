@@ -166,6 +166,7 @@ class MaskPainterDialog(tk.Toplevel):
         self.disp_w = max(64, int(round(self.orig_w * scale)))
         self.disp_h = max(64, int(round(self.orig_h * scale)))
         self.scale = scale
+        self._display_base = self.src_img.resize((self.disp_w, self.disp_h), Image.Resampling.LANCZOS)
 
         if initial_mask_png:
             try:
@@ -286,12 +287,11 @@ class MaskPainterDialog(tk.Toplevel):
     def _render_preview(self) -> None:
         if ImageTk is None:
             return
-        base_small = self.src_img.resize((self.disp_w, self.disp_h), Image.Resampling.BILINEAR)
         mask_small = self.mask_img.resize((self.disp_w, self.disp_h), Image.Resampling.NEAREST)
         alpha = mask_small.point(lambda v: 145 if v > 127 else 0)
         red_overlay = Image.new("RGBA", (self.disp_w, self.disp_h), (225, 29, 72, 0))
         red_overlay.putalpha(alpha)
-        comp = Image.alpha_composite(base_small, red_overlay)
+        comp = Image.alpha_composite(self._display_base, red_overlay)
         self._tk_img = ImageTk.PhotoImage(comp)
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_img)
@@ -527,7 +527,7 @@ class MossLayoutDialog(tk.Toplevel):
 
 
 class GallerySidebar(ttk.LabelFrame):
-    """本地受保护作品画廊侧边栏 + 一键复刻 Seed / 垫图局部重绘 / 送去图生视频"""
+    """本地作品画廊侧边栏（解密产物以明文落盘便于系统查看；配方元数据索引由 DPAPI / POSIX 0600 保护）"""
 
     def __init__(
         self,
@@ -537,7 +537,7 @@ class GallerySidebar(ttk.LabelFrame):
         on_send_to_img2img: Callable[[str], None],
         on_send_to_i2v: Callable[[str], None],
     ) -> None:
-        super().__init__(parent, text="🖼️ 本地加密作品画廊 & 流水线串联", padding=8)
+        super().__init__(parent, text="🖼️ 本地作品画廊（明文产物 · DPAPI/0600 配方索引）", padding=8)
         self.output_dir = output_dir
         self.on_restore_recipe = on_restore_recipe
         self.on_send_to_img2img = on_send_to_img2img
@@ -548,7 +548,7 @@ class GallerySidebar(ttk.LabelFrame):
 
         self.preview_lbl = tk.Label(
             self,
-            text="暂无选中产物\n解密取回后自动在此预览",
+            text="暂无选中产物\n解密明文落盘后自动在此预览",
             width=28,
             height=11,
             bg="#f1f5f9",
@@ -558,7 +558,7 @@ class GallerySidebar(ttk.LabelFrame):
         self.preview_lbl.pack(fill=tk.X, pady=(0, 6))
         self.preview_lbl.bind("<Double-Button-1>", lambda _e: self.open_selected_file())
 
-        self.var_meta = tk.StringVar(value="双击预览图可用系统查看器打开")
+        self.var_meta = tk.StringVar(value="产物以明文落盘至输出目录，配方索引由 DPAPI/0600 保护（双击打开）")
         ttk.Label(self, textvariable=self.var_meta, foreground="#334155", wraplength=240, justify=tk.LEFT).pack(
             anchor=tk.W, pady=(0, 4)
         )
@@ -676,9 +676,14 @@ class GallerySidebar(ttk.LabelFrame):
         bn = os.path.basename(path)
         meta = self._vault.get(bn)
         if not meta or not meta.get("prompt"):
-            messagebox.showinfo("提示", "该早期产物未记录完整提示词配方（新生成的产物均会自动在本机加密归档完整参数与 Seed）。")
+            messagebox.showinfo(
+                "提示",
+                "该早期产物未记录完整提示词配方（新产物以明文落盘，对应配方索引由本机 DPAPI/0600 保护）。",
+            )
             return
-        self.on_restore_recipe(meta)
+        restored = dict(meta)
+        restored["_is_image"] = not path.lower().endswith(".mp4")
+        self.on_restore_recipe(restored)
 
     def _act_img2img(self) -> None:
         path = self._selected_path()

@@ -48,12 +48,24 @@ from .crypto import (
     save_encrypted_secrets,
     unpack_encrypted_zip,
 )
+from .job_ledger import JobLedger, default_ledger_path
 from .local_bridge import (
     bind_sillytavern_client,
-    configure_local_bridge,
     default_secrets_path,
-    query_local_bridge_status,
+    sillytavern_profiles,
     start_local_bridge_background,
+)
+from .mailbox_delivery import (
+    CLAIMS_PREFIX,
+    RECEIPTS_PREFIX,
+    MailboxPacketInfo,
+    burn_packets_conditional,
+    commit_with_parent_retry,
+    download_verified_packet,
+    enqueue_job_v2,
+    is_queue_job_path,
+    list_inbox_packets_with_revision,
+    make_queue_v2_path,
 )
 from .studio_widgets import (
     GallerySidebar,
@@ -118,6 +130,67 @@ def save_secrets(work_dir: str, data: Dict[str, Any]) -> None:
     save_encrypted_secrets(default_secrets_path(work_dir), data)
 
 
+def validate_media_batch(category: str, batch: int) -> int:
+    """前置校验生成批次：视频管线严格限制 batch=1，图像管线要求 batch>=1。"""
+    b = int(batch)
+    if b < 1:
+        raise ValueError("批次 (batch) 必须为 >= 1 的整数。")
+    if str(category or "").startswith("video") and b != 1:
+        raise ValueError("视频生成模型当前仅支持 batch=1，请将批次修改为 1 后再提交。")
+    return b
+
+
+def strip_queue_job_secrets(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """双向队列任务剥离 hf_token（远端守护进程已在内存中持有信箱凭据，队列密文绝不重复携带 Token）。"""
+    cleaned = dict(payload)
+    cleaned.pop("hf_token", None)
+    return cleaned
+
+
+def resolve_recipe_restore_values(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    从画廊配方元数据还原表单参数：
+    - 优先读取超分前的 base_width / base_height，避免复刻 2x 超分产物时分辨率再次翻倍；
+    - 兼容旧版未记录 base_width/base_height 的超分图像配方，按 1/2 自动折算回基础分辨率；
+    - 总是显式返回 lora_repo / lora_weight / lora_strength，防止旧任务的 LoRA 配置残留到新复刻配方。
+    """
+    out: Dict[str, Any] = {}
+    base_w = meta.get("base_width")
+    base_h = meta.get("base_height")
+    if base_w is not None and base_h is not None:
+        out["width"] = int(base_w)
+        out["height"] = int(base_h)
+    else:
+        raw_w = meta.get("width")
+        raw_h = meta.get("height")
+        if raw_w is not None and raw_h is not None:
+            w_val = int(raw_w)
+            h_val = int(raw_h)
+            if bool(meta.get("upscale_2x")) and bool(meta.get("_is_image", True)):
+                w_val = max(64, ((w_val // 2) // 16) * 16)
+                h_val = max(64, ((h_val // 2) // 16) * 16)
+            out["width"] = w_val
+            out["height"] = h_val
+    out["lora_repo"] = str(meta.get("lora_repo") or "")
+    out["lora_weight"] = str(meta.get("lora_weight") or "")
+    strength_val = meta.get("lora_strength")
+    out["lora_strength"] = str(strength_val) if strength_val is not None and str(strength_val).strip() else "0.8"
+    return out
+
+
+def format_burn_report(saved_count: int, burn_res: Optional[Dict[str, Any]]) -> str:
+    """按 burn_packets_conditional 返回结果如实汇报当前仓库版本实际移除的密文分片数量。"""
+    res = burn_res or {}
+    removed = int(res.get("removed_count", 0))
+    skipped = len(res.get("skipped_paths") or ())
+    if skipped > 0:
+        return (
+            f"✅ 已解密还原 {saved_count} 个产物；当前仓库版本实际移除 {removed} 个密文分片"
+            f"（跳过 {skipped} 个已变更或已消失分片）"
+        )
+    return f"✅ 已解密还原 {saved_count} 个产物；当前仓库版本已移除 {removed} 个远端密文分片"
+
+
 class ZeroTrustBridgeApp(tk.Tk):
     def __init__(
         self,
@@ -125,6 +198,7 @@ class ZeroTrustBridgeApp(tk.Tk):
         port: int = DEFAULT_LOCAL_PORT,
         start_minimized: bool = False,
         enable_tray: bool = True,
+        initial_output_directory: str | None = None,
     ) -> None:
         enable_high_dpi()
         set_app_user_model_id(APP_USER_MODEL_ID)
@@ -142,16 +216,18 @@ class ZeroTrustBridgeApp(tk.Tk):
         self._auto_watch_active = False
         self._pull_lock = threading.Lock()
         self._ensured_repos: Set[str] = set()
+        self._ledger = JobLedger(default_ledger_path(self.work_dir))
 
         self.cfg = load_secrets(self.work_dir)
-        raw_out = str(self.cfg.get("output_dir") or "").strip()
-        self.output_dir = os.path.abspath(raw_out) if raw_out else self.default_output_dir
+        raw_out = str(initial_output_directory or self.cfg.get("output_dir") or "").strip()
+        self.initial_output_directory = os.path.abspath(raw_out) if raw_out else self.default_output_dir
+        self.output_dir = self.initial_output_directory
         os.makedirs(self.output_dir, exist_ok=True)
 
         self.title(PANEL_WINDOW_TITLE)
         apply_tk_window_icon(self, _get_icon_path())
-        self.geometry("1220x825")
-        self.minsize(1020, 720)
+        self.geometry("1220x855")
+        self.minsize(1020, 740)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.llm_catalog = get_merged_llm_presets(self.cfg.get("custom_llms"))
@@ -176,16 +252,20 @@ class ZeroTrustBridgeApp(tk.Tk):
             )
             self._tray.start()
 
-        start_local_bridge_background(
+        self._bridge_server, self._bridge_state = start_local_bridge_background(
             port=self.port,
             work_dir=self.work_dir,
             watch_clipboard=True,
             on_status_change=lambda st: self._ui_call(lambda s=st: self._refresh_bridge_ui(s)),
         )
+        self._owns_bridge: bool = self._bridge_server is not None
+        self._apply_bridge_ownership_ui()
+
         self.after(50, self._pump_ui_queue)
+        self.after(900, self._resume_pending_jobs)
         if start_minimized and self._tray is not None and self._tray.active:
             self.hide_to_tray(notify=False)
-        else:
+        elif self._owns_bridge:
             self.after(600, self._poll_bridge_status)
 
     def _ui_call(self, cb: Callable[[], None]) -> None:
@@ -263,6 +343,19 @@ class ZeroTrustBridgeApp(tk.Tk):
         self._closing = True
         self._hidden_to_tray = False
         self._auto_watch_active = False
+        if getattr(self, "_bridge_server", None) is not None:
+            srv = self._bridge_server
+            self._bridge_server = None
+            try:
+                srv.shutdown()
+                srv.server_close()
+            except Exception:
+                pass
+        if getattr(self, "_ledger", None) is not None:
+            try:
+                self._ledger.close()
+            except Exception:
+                pass
         if self._tray is not None:
             try:
                 self._tray.stop()
@@ -272,6 +365,24 @@ class ZeroTrustBridgeApp(tk.Tk):
             self.destroy()
         except Exception:
             pass
+
+    def _apply_bridge_ownership_ui(self) -> None:
+        """面板仅托管本进程自启网桥；若目标端口已被其他进程占用，禁用票据与客户端绑定，绝不向外部监听器外发口令。"""
+        if self._owns_bridge:
+            return
+        for widget_name in ("btn_bind_ticket", "entry_ticket", "btn_bind_client"):
+            w = getattr(self, widget_name, None)
+            if w is not None:
+                try:
+                    w.configure(state=tk.DISABLED)
+                except Exception:
+                    pass
+        self.var_bridge_status.set(
+            f"🔴 端口 127.0.0.1:{self.port} 已被其他进程占用 · 已禁用票据与客户端绑定（绝不向非本进程监听器外发口令）"
+        )
+        self.status_var.set(f"⚠️ 端口 127.0.0.1:{self.port} 已被占用，请关闭冲突进程或通过 --port 指定空闲端口后重启")
+        if self._tray is not None and self._tray.active:
+            self._tray.update_tooltip(f"Kiss-Shot [端口冲突已锁定] · 127.0.0.1:{self.port}")
 
     def _on_close(self) -> None:
         if self._tray is not None and self._tray.active:
@@ -381,11 +492,12 @@ class ZeroTrustBridgeApp(tk.Tk):
             style="Accent.TButton",
             command=self._generate_llm_hex,
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        ttk.Button(
+        self.btn_bind_client = ttk.Button(
             btn_row,
             text="🔗 一键写入可选本地客户端配置",
             command=self._bind_optional_client,
-        ).pack(side=tk.LEFT)
+        )
+        self.btn_bind_client.pack(side=tk.LEFT)
 
         self.txt_llm_hex = scrolledtext.ScrolledText(f, height=4, font=("Consolas", 9), wrap=tk.CHAR)
         self.txt_llm_hex.pack(fill=tk.X, pady=(2, 10))
@@ -407,15 +519,15 @@ class ZeroTrustBridgeApp(tk.Tk):
         t_row = ttk.Frame(bridge_box)
         t_row.pack(fill=tk.X)
         self.var_ticket_input = tk.StringVar(value="")
-        ttk.Entry(t_row, textvariable=self.var_ticket_input, font=("Consolas", 9)).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6)
-        )
-        ttk.Button(
+        self.entry_ticket = ttk.Entry(t_row, textvariable=self.var_ticket_input, font=("Consolas", 9))
+        self.entry_ticket.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.btn_bind_ticket = ttk.Button(
             t_row,
             text="📋 粘贴票据并执行 AEAD 握手",
             style="Accent.TButton",
             command=self._paste_and_bind_ticket,
-        ).pack(side=tk.LEFT)
+        )
+        self.btn_bind_ticket.pack(side=tk.LEFT)
 
     # -------------------- Tab 2: Automated Ciphertext Queue & Visual Studio --------------------
     def _build_media_tab(self, ui_font: str) -> None:
@@ -476,6 +588,9 @@ class ZeroTrustBridgeApp(tk.Tk):
         self.var_seed = tk.StringVar(value="-1")
         self.var_strength = tk.StringVar(value="0.65")
         self.var_upscale_2x = tk.BooleanVar(value=False)
+        self.var_lora_repo = tk.StringVar(value="")
+        self.var_lora_weight = tk.StringVar(value="")
+        self.var_lora_strength = tk.StringVar(value="0.8")
 
         params = [
             ("宽(W):", self.var_w, 6),
@@ -499,6 +614,15 @@ class ZeroTrustBridgeApp(tk.Tk):
             text="✨ 2x 超分高清放大（远端显存内分块 Real-ESRGAN 直出超清大图）",
             variable=self.var_upscale_2x,
         ).pack(side=tk.LEFT)
+
+        p_row3 = ttk.Frame(p_box)
+        p_row3.grid(row=2, column=0, columnspan=14, sticky=tk.EW, pady=(6, 0))
+        ttk.Label(p_row3, text="可选 LoRA 仓库 (owner/repo):").pack(side=tk.LEFT)
+        ttk.Entry(p_row3, textvariable=self.var_lora_repo, width=26).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(p_row3, text="权重文件名:").pack(side=tk.LEFT)
+        ttk.Entry(p_row3, textvariable=self.var_lora_weight, width=20).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(p_row3, text="强度:").pack(side=tk.LEFT)
+        ttk.Entry(p_row3, textvariable=self.var_lora_strength, width=5).pack(side=tk.LEFT, padx=(4, 0))
 
         ref_box = ttk.LabelFrame(
             f,
@@ -728,6 +852,8 @@ class ZeroTrustBridgeApp(tk.Tk):
                 detected_arch = "cogvideox_i2v"
             elif "hunyuanvideo15" in cls_low:
                 detected_arch = "hunyuan15_t2v"
+            elif "ti2v-5b" in src_repo.lower() or "ti2v_5b" in src_repo.lower():
+                detected_arch = "wan_ti2v_5b"
             elif "wanimagetovideo" in cls_low:
                 detected_arch = "wan_i2v"
             elif "wan" in cls_low:
@@ -1019,9 +1145,12 @@ class ZeroTrustBridgeApp(tk.Tk):
         if "negative_prompt" in meta:
             self.txt_neg.delete("1.0", tk.END)
             self.txt_neg.insert("1.0", str(meta["negative_prompt"]))
+        restored = resolve_recipe_restore_values(meta)
+        if restored.get("width") is not None:
+            self.var_w.set(str(restored["width"]))
+        if restored.get("height") is not None:
+            self.var_h.set(str(restored["height"]))
         for k_meta, var in (
-            ("width", self.var_w),
-            ("height", self.var_h),
             ("steps", self.var_steps),
             ("cfg", self.var_cfg),
             ("frames", self.var_frames),
@@ -1032,6 +1161,9 @@ class ZeroTrustBridgeApp(tk.Tk):
                 var.set(str(meta[k_meta]))
         if meta.get("upscale_2x") is not None:
             self.var_upscale_2x.set(bool(meta["upscale_2x"]))
+        self.var_lora_repo.set(restored["lora_repo"])
+        self.var_lora_weight.set(restored["lora_weight"])
+        self.var_lora_strength.set(restored["lora_strength"])
         self.status_var.set(f"🔒 已复刻作品参数与随机种子 (Seed: {meta.get('seed')})")
 
     def _load_image_for_img2img(self, path: str) -> None:
@@ -1075,8 +1207,7 @@ class ZeroTrustBridgeApp(tk.Tk):
         def _scrub_if_unchanged() -> None:
             self._clip_timer_id = None
             try:
-                if read_clipboard_text().strip() == text.strip():
-                    clear_clipboard_text()
+                clear_clipboard_text(expected=text)
             except Exception:
                 pass
 
@@ -1132,8 +1263,11 @@ class ZeroTrustBridgeApp(tk.Tk):
 
         prev_out = self.output_dir
         migrated = 0
-        if os.path.normcase(prev_out) != os.path.normcase(new_out) and os.path.isdir(prev_out):
-            if silent or messagebox.askyesno(
+        if os.path.normcase(prev_out) != os.path.normcase(new_out):
+            if silent:
+                # 静默保存（及 initial_output_directory 启动初始化）绝不静默搬迁历史目录
+                new_out = prev_out
+            elif os.path.isdir(prev_out) and messagebox.askyesno(
                 "迁移历史产物与加密配方",
                 f"检测到产物目录变更：\n原目录：{prev_out}\n新目录：{new_out}\n\n是否将原目录中的已解密文件及加密画廊配方一并无损迁入新目录？",
             ):
@@ -1232,7 +1366,55 @@ class ZeroTrustBridgeApp(tk.Tk):
         self._copy_ephemeral_secret(hex_tok)
         self.status_var.set("✅ 远端启动密文 KISSSHOT_LLM_HEX 已生成并复制（90 秒自动销毁剪贴板）")
 
+    def _choose_sillytavern_profile(self, profiles: List[str]) -> Optional[str]:
+        """多用户配置档下弹出单选对话框，强制用户显式选择单一目标 profile，绝不批量覆写。"""
+        selected: Dict[str, Optional[str]] = {"value": None}
+        dlg = tk.Toplevel(self)
+        dlg.title("选择要绑定的单个 SillyTavern 用户配置档")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        frm = ttk.Frame(dlg, padding=14)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            frm,
+            text=(
+                f"检测到 {len(profiles)} 个 SillyTavern 用户配置档。\n"
+                "为防止误覆写其他用户配置，请仅选择 1 个需要绑定到本地加密网桥的配置档："
+            ),
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 8))
+
+        var_choice = tk.StringVar(value=profiles[0])
+        cb = ttk.Combobox(frm, textvariable=var_choice, values=profiles, state="readonly", width=36)
+        cb.pack(fill=tk.X, pady=(0, 12))
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill=tk.X)
+
+        def _confirm() -> None:
+            selected["value"] = var_choice.get().strip() or None
+            dlg.destroy()
+
+        def _cancel() -> None:
+            selected["value"] = None
+            dlg.destroy()
+
+        ttk.Button(btns, text="取消", command=_cancel).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(btns, text="确认绑定该配置档", style="Accent.TButton", command=_confirm).pack(side=tk.RIGHT)
+        dlg.protocol("WM_DELETE_WINDOW", _cancel)
+        dlg.wait_window()
+        return selected["value"]
+
     def _bind_optional_client(self) -> None:
+        if not self._owns_bridge:
+            messagebox.showwarning(
+                "网桥端口冲突",
+                f"端口 127.0.0.1:{self.port} 已被其他进程占用，面板未托管该监听器。\n"
+                "为防止将客户端指向未知本地进程，已禁用一键客户端绑定。",
+            )
+            return
         cdir = self.cfg.get("client_dir", "").strip() or self.var_client_dir.get().strip()
         if not cdir:
             messagebox.showinfo(
@@ -1243,19 +1425,49 @@ class ZeroTrustBridgeApp(tk.Tk):
                 f"如需一键写入本地客户端目录，可在第 3 页配置目录路径。",
             )
             return
-        cnt, live_ok = bind_sillytavern_client(Path(cdir), port=self.port)
+        st_root = Path(cdir)
+        profiles = sillytavern_profiles(st_root)
+        if not profiles:
+            messagebox.showwarning(
+                "未发现客户端配置档",
+                f"在所选目录下未检测到 SillyTavern 用户配置档 (data/*/settings.json)：\n{cdir}",
+            )
+            return
+        if len(profiles) == 1:
+            target_profile = profiles[0]
+        else:
+            picked = self._choose_sillytavern_profile(profiles)
+            if not picked:
+                return
+            target_profile = picked
+        try:
+            cnt, live_ok = bind_sillytavern_client(st_root, port=self.port, profile=target_profile)
+        except Exception as exc:
+            self._on_error("客户端绑定失败", str(exc))
+            return
         messagebox.showinfo(
             "客户端绑定结果",
-            f"已更新配置文件数量: {cnt}\n在线热同步状态: {'成功' if live_ok else '离线（下次启动生效）'}",
+            f"目标配置档: {target_profile}\n"
+            f"已更新配置文件数量: {cnt}（首次修改已自动备份 settings.before-kiss-shot.json）\n"
+            f"在线热同步状态: {'成功' if live_ok else '离线（下次启动生效）'}",
         )
 
     def _paste_and_bind_ticket(self) -> None:
+        if not self._owns_bridge or self._bridge_state is None:
+            messagebox.showwarning(
+                "网桥未托管（端口被占用）",
+                f"端口 127.0.0.1:{self.port} 已被其他进程占用。\n"
+                "本面板绝不向非本进程启动的本地监听器发送主口令或握手票据，请释放端口或使用 --port 指定空闲端口后重启。",
+            )
+            return
         if not self._save_settings(silent=True):
             return
         raw = self.var_ticket_input.get().strip()
         if not raw:
             try:
-                raw = self.clipboard_get().strip()
+                raw = (read_clipboard_text() or "").strip()
+                if not raw:
+                    raw = self.clipboard_get().strip()
                 self.var_ticket_input.set(raw)
             except Exception:
                 pass
@@ -1263,12 +1475,14 @@ class ZeroTrustBridgeApp(tk.Tk):
             messagebox.showwarning("票据为空", "请先复制远端网关输出的 KISSSHOT_TICKET:... 握手票据。")
             return
 
+        bridge_state = self._bridge_state
+        pwd = self.cfg["passphrase"]
         self.status_var.set("正在与远端动态路由执行端到端 AES-256-GCM 双向认证握手...")
 
         def worker() -> None:
-            ok, msg = configure_local_bridge(raw, self.cfg["passphrase"], port=self.port, work_dir=self.work_dir)
-            st = query_local_bridge_status(self.port, work_dir=self.work_dir) or {}
-            self.after(0, lambda: self._on_ticket_bound(ok, msg, st))
+            ok, msg = bridge_state.configure_with_ticket(raw, passphrase_override=pwd, persist=True)
+            st = bridge_state.snapshot(listen_port=self.port)
+            self._ui_call(lambda: self._on_ticket_bound(ok, msg, st))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1286,7 +1500,7 @@ class ZeroTrustBridgeApp(tk.Tk):
             self._on_error("握手未通过", msg)
 
     def _refresh_bridge_ui(self, st: Dict[str, Any]) -> None:
-        if not st or self._closing:
+        if not st or self._closing or not self._owns_bridge:
             return
         if st.get("connected") and not st.get("last_err"):
             cnt = st.get("req_count", 0)
@@ -1308,16 +1522,16 @@ class ZeroTrustBridgeApp(tk.Tk):
                 self._tray.update_tooltip(f"Kiss-Shot [待命监听] · 127.0.0.1:{self.port}/v1")
 
     def _poll_bridge_status(self) -> None:
-        if self._closing or self._hidden_to_tray:
+        if self._closing or self._hidden_to_tray or not self._owns_bridge or self._bridge_state is None:
             return
-
-        def worker() -> None:
-            st = query_local_bridge_status(self.port, work_dir=self.work_dir)
+        try:
+            st = self._bridge_state.snapshot(listen_port=self.port)
             if st:
-                self._ui_call(lambda s=st: self._refresh_bridge_ui(s))
-
-        threading.Thread(target=worker, daemon=True).start()
-        self.after(3000, self._poll_bridge_status)
+                self._refresh_bridge_ui(st)
+        except Exception:
+            pass
+        if not self._closing and not self._hidden_to_tray and self._owns_bridge:
+            self.after(3000, self._poll_bridge_status)
 
     # -------------------- Media Task & Bidirectional Queue --------------------
     def _ensure_mailbox_once(self, api: HfApi, mailbox_repo: str) -> None:
@@ -1346,7 +1560,17 @@ class ZeroTrustBridgeApp(tk.Tk):
             return None
 
         try:
+            batch_val = validate_media_batch(m_spec["category"], int(self.var_batch.get()))
             strength_val = max(0.05, min(1.0, float(self.var_strength.get() or 0.65)))
+            lora_repo_raw = self.var_lora_repo.get().strip()
+            lora_repo = parse_hf_repo_id(lora_repo_raw) if lora_repo_raw else ""
+            lora_weight = self.var_lora_weight.get().strip()
+            if lora_weight and ("\\" in lora_weight or ".." in lora_weight or lora_weight.startswith("/")):
+                raise ValueError("LoRA 权重文件名包含非法路径片段（禁止 '..'、反斜杠或绝对路径）。")
+            lora_strength_raw = self.var_lora_strength.get().strip()
+            lora_strength = max(0.0, min(2.0, float(lora_strength_raw))) if lora_strength_raw else 0.8
+            width_val = int(self.var_w.get())
+            height_val = int(self.var_h.get())
             payload: Dict[str, Any] = {
                 "type": "kissshot_media_infer",
                 "preset_key": m_key,
@@ -1359,15 +1583,20 @@ class ZeroTrustBridgeApp(tk.Tk):
                 "mailbox_repo": f"{hf_user}/{suffix}",
                 "prompt": self.txt_pos.get("1.0", tk.END).strip(),
                 "negative_prompt": self.txt_neg.get("1.0", tk.END).strip(),
-                "width": int(self.var_w.get()),
-                "height": int(self.var_h.get()),
+                "width": width_val,
+                "height": height_val,
+                "base_width": width_val,
+                "base_height": height_val,
                 "steps": int(self.var_steps.get()),
                 "cfg": float(self.var_cfg.get()),
                 "frames": int(self.var_frames.get()),
-                "batch": int(self.var_batch.get()),
+                "batch": batch_val,
                 "seed": int(self.var_seed.get()),
                 "strength": strength_val,
                 "upscale_2x": bool(self.var_upscale_2x.get()),
+                "lora_repo": lora_repo,
+                "lora_weight": lora_weight,
+                "lora_strength": lora_strength,
                 "ref_staging_blob": "",
                 "mask_staging_blob": "",
             }
@@ -1383,8 +1612,9 @@ class ZeroTrustBridgeApp(tk.Tk):
         ref_local: str,
         mask_png: Optional[bytes],
         pwd: str,
-    ) -> List[CommitOperationAdd]:
+    ) -> Tuple[List[CommitOperationAdd], List[Tuple[str, str, bytes]]]:
         ops: List[CommitOperationAdd] = []
+        blobs: List[Tuple[str, str, bytes]] = []
         if ref_local:
             if not os.path.isfile(ref_local):
                 raise FileNotFoundError(ref_local)
@@ -1393,6 +1623,7 @@ class ZeroTrustBridgeApp(tk.Tk):
                 enc_img = encrypt_bytes_aes(rf.read(), pwd)
             staging_rel = f"_staging/ref_{secrets.token_hex(6)}.bin"
             ops.append(CommitOperationAdd(path_in_repo=staging_rel, path_or_fileobj=enc_img))
+            blobs.append((staging_rel, "ref", enc_img))
             payload["ref_staging_blob"] = staging_rel
 
         if mask_png:
@@ -1400,8 +1631,9 @@ class ZeroTrustBridgeApp(tk.Tk):
             enc_mask = encrypt_bytes_aes(mask_png, pwd)
             mask_rel = f"_staging/mask_{secrets.token_hex(6)}.bin"
             ops.append(CommitOperationAdd(path_in_repo=mask_rel, path_or_fileobj=enc_mask))
+            blobs.append((mask_rel, "mask", enc_mask))
             payload["mask_staging_blob"] = mask_rel
-        return ops
+        return ops, blobs
 
     def _generate_daemon_hex(self) -> None:
         if not self._save_settings(silent=True):
@@ -1439,34 +1671,144 @@ class ZeroTrustBridgeApp(tk.Tk):
         payload, ref_local, mask_png = built
         pwd = self.cfg["passphrase"]
         hf_token = self.cfg["hf_token"]
-        self.status_var.set("🚀 正在使用 AAD_QUEUE 密封任务并原子投递至私有密文信箱...")
+        mailbox_repo = payload["mailbox_repo"]
+        job_id = secrets.token_hex(8)
+        job_rel = make_queue_v2_path(job_id)
+        payload["job_id"] = job_id
+        self.status_var.set("🚀 正在使用 AAD_QUEUE 密封任务（零 Token 载荷）并原子投递至 _queue/v2/...")
 
         def worker() -> None:
+            ledger_created = False
             try:
                 api = HfApi(token=hf_token)
-                ops = self._prepare_staging_commits(payload, ref_local, mask_png, pwd)
-                job_bytes = encrypt_queue_job(payload, pwd)
-                job_rel = f"_queue/job_{int(time.time())}_{secrets.token_hex(4)}.bin"
-                ops.append(CommitOperationAdd(path_in_repo=job_rel, path_or_fileobj=job_bytes))
-                self._ensure_mailbox_once(api, payload["mailbox_repo"])
-                api.create_commit(
-                    repo_id=payload["mailbox_repo"],
-                    repo_type="model",
-                    operations=ops,
-                    commit_message="enqueue kissshot job",
+                staging_ops, staging_blobs = self._prepare_staging_commits(payload, ref_local, mask_png, pwd)
+                queue_payload = strip_queue_job_secrets(payload)
+                job_bytes = encrypt_queue_job(queue_payload, pwd)
+                outbox_blobs = list(staging_blobs) + [(job_rel, "queue", job_bytes)]
+                self._ledger.create_job(
+                    job_id=job_id,
+                    mailbox_repo=mailbox_repo,
+                    queue_rel=job_rel,
+                    preset_key=str(payload.get("preset_key") or ""),
+                    arch=str(payload.get("arch") or ""),
+                    ref_rel=str(payload.get("ref_staging_blob") or ""),
+                    mask_rel=str(payload.get("mask_staging_blob") or ""),
+                    outbox_blobs=outbox_blobs,
+                    state="pending_upload",
                 )
-                self._ui_call(lambda jr=job_rel: self._on_job_enqueued(jr))
+                ledger_created = True
+                self._ensure_mailbox_once(api, mailbox_repo)
+                enqueue_job_v2(
+                    api,
+                    mailbox_repo,
+                    job_rel,
+                    job_bytes,
+                    staging_ops=staging_ops,
+                )
+                self._ledger.mark_outbox_uploaded(job_id)
+                self._ledger.purge_outbox_blobs(job_id)
+                self._ledger.update_job_state(job_id, "queued", last_error="", increment_attempts=True)
+                self._ui_call(lambda jr=job_rel, jid=job_id: self._on_job_enqueued(jr, job_id=jid))
             except Exception as exc:
-                self._ui_call(lambda err=str(exc): self._on_error("加密入队失败", err))
+                if ledger_created:
+                    try:
+                        self._ledger.record_failure(job_id, "enqueue_upload", str(exc), retryable=True)
+                        self._ledger.update_job_state(job_id, "pending_upload", last_error=str(exc), increment_attempts=True)
+                    except Exception:
+                        pass
+                self._ui_call(
+                    lambda err=str(exc), saved=ledger_created: self._on_error(
+                        "加密入队失败（已加密暂存本地账本，重启可续传）" if saved else "加密入队失败",
+                        err,
+                    )
+                )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_job_enqueued(self, job_rel: str) -> None:
-        self.status_var.set(f"⏳ 已投递队列密文 {os.path.basename(job_rel)} · 正在后台监听远端接单与加密归档回传...")
+    def _on_job_enqueued(self, job_rel: str, job_id: str = "") -> None:
+        tag = job_id[:8] if job_id else os.path.basename(job_rel)
+        self.status_var.set(f"⏳ 已条件提交队列密文 [{tag}] · 正在后台监听远端认领与加密归档回传...")
         start_ts = time.time()
         if not self._auto_watch_active:
             self._auto_watch_active = True
             self.after(1800, lambda: self._auto_watch_tick(job_rel, ticks=0, start_ts=start_ts))
+
+    def _resume_pending_jobs(self) -> None:
+        """启动时扫描本地 SQLite 加密任务账本：补传 pending_upload 加密发件箱，并对未完结任务续跑监听。"""
+        if self._closing:
+            return
+        hf_token = (self.cfg.get("hf_token") or "").strip()
+        hf_user = (self.cfg.get("hf_user") or "").strip()
+        suffix = self.cfg.get("mailbox_suffix") or DEFAULT_MAILBOX_REPO_NAME
+        if not hf_token or not hf_user:
+            return
+        mailbox_repo = f"{hf_user}/{suffix}"
+        try:
+            active_jobs = self._ledger.list_active_jobs(mailbox_repo=mailbox_repo)
+        except Exception:
+            return
+        if not active_jobs:
+            return
+
+        def worker() -> None:
+            api = HfApi(token=hf_token)
+            resumed_uploads = 0
+            for job in active_jobs:
+                if self._closing:
+                    return
+                if job.get("state") != "pending_upload":
+                    continue
+                jid = job["job_id"]
+                try:
+                    blobs = self._ledger.get_outbox_blobs(jid, include_uploaded=False)
+                    q_blob: Optional[bytes] = None
+                    staging_ops: List[CommitOperationAdd] = []
+                    for b in blobs:
+                        if b["kind"] == "queue":
+                            q_blob = b["ciphertext"]
+                        else:
+                            staging_ops.append(
+                                CommitOperationAdd(path_in_repo=b["path_in_repo"], path_or_fileobj=b["ciphertext"])
+                            )
+                    if q_blob is None:
+                        self._ledger.update_job_state(jid, "queued", last_error="")
+                        continue
+                    self._ensure_mailbox_once(api, mailbox_repo)
+                    enqueue_job_v2(api, mailbox_repo, job["queue_rel"], q_blob, staging_ops=staging_ops)
+                    self._ledger.mark_outbox_uploaded(jid)
+                    self._ledger.purge_outbox_blobs(jid)
+                    self._ledger.update_job_state(jid, "queued", last_error="", increment_attempts=True)
+                    resumed_uploads += 1
+                except Exception as exc:
+                    try:
+                        self._ledger.record_failure(jid, "resume_upload", str(exc), retryable=True)
+                        self._ledger.update_job_state(jid, "pending_upload", last_error=str(exc), increment_attempts=True)
+                    except Exception:
+                        pass
+
+            try:
+                remaining = self._ledger.list_active_jobs(mailbox_repo=mailbox_repo)
+            except Exception:
+                remaining = []
+            if not remaining or self._closing:
+                return
+            latest_rel = remaining[-1]["queue_rel"]
+            cnt = len(remaining)
+            msg = (
+                f"🔄 已从本地加密账本恢复 {cnt} 个未完结任务"
+                + (f"（续传 {resumed_uploads} 条发件箱）" if resumed_uploads else "")
+                + " · 正在继续监听远端进度..."
+            )
+
+            def _start_watch() -> None:
+                self.status_var.set(msg)
+                if not self._auto_watch_active:
+                    self._auto_watch_active = True
+                    self.after(1200, lambda: self._auto_watch_tick(latest_rel, ticks=0, start_ts=time.time()))
+
+            self._ui_call(_start_watch)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _auto_watch_tick(self, job_rel: str, ticks: int, start_ts: Optional[float] = None) -> None:
         if self._closing or not self._auto_watch_active:
@@ -1487,28 +1829,42 @@ class ZeroTrustBridgeApp(tk.Tk):
             try:
                 api = HfApi(token=hf_token)
                 files = api.list_repo_files(repo_id=mailbox_repo, repo_type="model")
+                file_set = set(files)
                 inbox_files = sorted([f for f in files if f.startswith("_inbox/") and f.endswith(".bin")])
-                queue_files = [f for f in files if f.startswith("_queue/") and f.endswith(".bin")]
+                queue_files = [f for f in files if is_queue_job_path(f)]
+                claim_files = [f for f in files if f.startswith(CLAIMS_PREFIX) and f.endswith(".json")]
+
+                active_jobs = self._ledger.list_active_jobs(mailbox_repo=mailbox_repo)
+                for job in active_jobs:
+                    jid = job["job_id"]
+                    claim_path = f"{CLAIMS_PREFIX}{jid}.json"
+                    if claim_path in file_set and job.get("state") in ("queued", "pending_upload"):
+                        self._ledger.update_job_state(jid, "claimed")
+                    elif job.get("state") == "queued" and job["queue_rel"] not in file_set:
+                        self._ledger.update_job_state(jid, "running")
+
                 if inbox_files:
                     self._ui_call(
-                        lambda inf=list(inbox_files): self._pull_and_burn_inbox(
-                            silent_empty=True, auto_mode=True, known_inbox=inf
-                        )
+                        lambda: self._pull_and_burn_inbox(silent_empty=True, auto_mode=True)
                     )
-                    if not queue_files:
+                    still_active = [
+                        j for j in self._ledger.list_active_jobs(mailbox_repo=mailbox_repo)
+                        if j.get("state") in ("pending_upload", "queued", "claimed", "running")
+                    ]
+                    if not queue_files and not claim_files and not still_active:
                         self._auto_watch_active = False
                         return
-                elif job_rel not in queue_files:
+                elif claim_files or (job_rel not in file_set):
                     waited = max(1, int(time.time() - t_base))
                     self._ui_call(
                         lambda w=waited: self.status_var.set(
-                            f"🎨 远端 GPU 节点已接单并销毁队列密文，正在纯内存推理中... (已耗时 {w}s)"
+                            f"🎨 远端 GPU 节点已认领任务租约，正在纯内存推理中... (已耗时 {w}s)"
                         )
                     )
                 else:
                     self._ui_call(
                         lambda: self.status_var.set(
-                            "⏳ 密文任务已在信箱排队 · 若远端尚未启动守护循环，请点右侧「🛰️ 复制远端自动接单守护口令」运行一次"
+                            "⏳ 密文任务已在 _queue/v2/ 排队 · 若远端尚未启动守护循环，请点右侧「🛰️ 复制远端自动接单守护口令」运行一次"
                         )
                     )
             except Exception:
@@ -1531,19 +1887,19 @@ class ZeroTrustBridgeApp(tk.Tk):
         def worker() -> None:
             try:
                 api = HfApi(token=hf_token)
-                ops = self._prepare_staging_commits(payload, ref_local, mask_png, pwd)
+                ops, _blobs = self._prepare_staging_commits(payload, ref_local, mask_png, pwd)
                 if ops:
                     self._ensure_mailbox_once(api, payload["mailbox_repo"])
-                    api.create_commit(
+                    commit_with_parent_retry(
+                        api,
                         repo_id=payload["mailbox_repo"],
-                        repo_type="model",
                         operations=ops,
                         commit_message="stage encrypted inputs",
                     )
                 hex_tok = encrypt_payload_hex(payload, pwd)
-                self.after(0, lambda h=hex_tok: self._on_media_hex_ready(h))
+                self._ui_call(lambda h=hex_tok: self._on_media_hex_ready(h))
             except Exception as exc:
-                self.after(0, lambda err=str(exc): self._on_error("加密任务生成失败", err))
+                self._ui_call(lambda err=str(exc): self._on_error("加密任务生成失败", err))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1574,86 +1930,139 @@ class ZeroTrustBridgeApp(tk.Tk):
             return
 
         mailbox_repo = f"{hf_user}/{suffix}"
-        self.status_var.set("📥 正在检查私有密文信箱并拉取双层 AEAD 归档...")
+        self.status_var.set("📥 正在锁定仓库版本快照并校验拉取双层 AEAD 归档...")
 
         def worker() -> None:
             try:
                 api = HfApi(token=hf_token)
+                revision, packets = list_inbox_packets_with_revision(api, mailbox_repo)
                 if known_inbox:
-                    inbox_files = sorted(known_inbox)
-                else:
-                    files = api.list_repo_files(repo_id=mailbox_repo, repo_type="model")
-                    inbox_files = sorted([f for f in files if f.startswith("_inbox/") and f.endswith(".bin")])
-                if not inbox_files:
+                    known_set = set(known_inbox)
+                    filtered = [p for p in packets if p.path in known_set]
+                    if filtered:
+                        packets = filtered
+                if not packets:
                     if not silent_empty:
-                        self.after(0, lambda: messagebox.showinfo("信箱为空", "当前私有中转仓没有待取回的加密分片。"))
-                        self.after(0, lambda: self.status_var.set("私有密文信箱为空"))
+                        self._ui_call(lambda: messagebox.showinfo("信箱为空", "当前私有中转仓没有待取回的加密分片。"))
+                        self._ui_call(lambda: self.status_var.set("私有密文信箱为空"))
                     return
 
                 all_saved: List[str] = []
-                burned_files: List[str] = []
+                verified_packets: List[MailboxPacketInfo] = []
+                packet_job_map: Dict[str, str] = {}
                 with tempfile.TemporaryDirectory() as tmpd:
-                    for remote_f in inbox_files:
-                        local_enc = hf_hub_download(
-                            repo_id=mailbox_repo,
-                            filename=remote_f,
-                            repo_type="model",
+                    for pkt in packets:
+                        if self._ledger.is_packet_processed(pkt.path, pkt.blob_id):
+                            rec = self._ledger.get_receipt(pkt.path)
+                            if rec and rec.get("job_id"):
+                                packet_job_map[pkt.path] = str(rec["job_id"])
+                            verified_packets.append(pkt)
+                            continue
+                        zip_bytes = download_verified_packet(
+                            mailbox_repo,
+                            pkt,
                             token=hf_token,
                             local_dir=tmpd,
                         )
-                        with open(local_enc, "rb") as zf_in:
-                            zip_bytes = zf_in.read()
-                        saved, meta = unpack_encrypted_zip(zip_bytes, pwd, self.output_dir, prefix="ks")
+                        pkt_id = os.path.splitext(os.path.basename(pkt.path))[0]
+                        saved, meta = unpack_encrypted_zip(
+                            zip_bytes,
+                            pwd,
+                            self.output_dir,
+                            prefix="ks",
+                            packet_id=pkt_id,
+                        )
                         try:
                             record_gallery_items(self.output_dir, saved, meta)
                         except Exception:
                             pass
-                        all_saved.extend(saved)
-                        burned_files.append(remote_f)
-
-                self.after(0, lambda p=list(all_saved), am=auto_mode: self._on_pulled_ok(p, auto_mode=am))
-                if burned_files:
-                    try:
-                        api.create_commit(
-                            repo_id=mailbox_repo,
-                            repo_type="model",
-                            operations=[CommitOperationDelete(path_in_repo=rf) for rf in burned_files],
-                            commit_message="burn decrypted artifacts",
-                        )
-                    except Exception:
-                        for rf in burned_files:
-                            try:
-                                api.delete_file(
-                                    path_in_repo=rf,
-                                    repo_id=mailbox_repo,
-                                    repo_type="model",
-                                    commit_message="burn decrypted artifact",
+                        jid = str(meta.get("job_id") or "").strip()
+                        if jid:
+                            packet_job_map[pkt.path] = jid
+                        try:
+                            self._ledger.record_receipt(
+                                pkt.path,
+                                job_id=jid,
+                                packet_blob_id=pkt.blob_id,
+                                packet_revision=revision or "",
+                                status="unpacked",
+                                saved_paths=saved,
+                            )
+                            if jid and self._ledger.get_job(jid):
+                                self._ledger.update_job_state(
+                                    jid,
+                                    "completed",
+                                    packet_rel=pkt.path,
+                                    packet_blob_id=pkt.blob_id,
+                                    saved_paths=saved,
                                 )
+                        except Exception:
+                            pass
+                        all_saved.extend(saved)
+                        verified_packets.append(pkt)
+
+                burn_res: Dict[str, Any]
+                if verified_packets:
+                    try:
+                        burn_res = burn_packets_conditional(
+                            api,
+                            mailbox_repo,
+                            verified_packets,
+                            parent_commit=revision,
+                        )
+                        for removed_rel in burn_res.get("removed_paths") or ():
+                            try:
+                                self._ledger.mark_receipt_burned(removed_rel)
+                                jid = packet_job_map.get(removed_rel, "")
+                                if jid and self._ledger.get_job(jid):
+                                    self._ledger.update_job_state(jid, "burned")
                             except Exception:
                                 pass
+                    except Exception as burn_exc:
+                        try:
+                            self._ledger.record_failure("", "burn_inbox", str(burn_exc), retryable=True)
+                        except Exception:
+                            pass
+                        burn_res = {
+                            "removed_count": 0,
+                            "removed_paths": [],
+                            "skipped_paths": [p.path for p in verified_packets],
+                            "error": str(burn_exc),
+                        }
+                else:
+                    burn_res = {"removed_count": 0, "removed_paths": [], "skipped_paths": []}
+
+                self._ui_call(
+                    lambda p=list(all_saved), am=auto_mode, br=burn_res: self._on_pulled_ok(
+                        p, auto_mode=am, burn_res=br
+                    )
+                )
             except Exception as exc:
-                self.after(0, lambda err=str(exc): self._on_error("拉取或解密失败", err))
+                self._ui_call(lambda err=str(exc): self._on_error("拉取或解密失败", err))
             finally:
                 self._pull_lock.release()
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_pulled_ok(self, paths: List[str], auto_mode: bool = False) -> None:
+    def _on_pulled_ok(
+        self,
+        paths: List[str],
+        auto_mode: bool = False,
+        burn_res: Optional[Dict[str, Any]] = None,
+    ) -> None:
         try:
-            self.gallery_sidebar.refresh(select_latest=True)
+            self.gallery_sidebar.refresh(select_latest=bool(paths))
         except Exception:
             pass
-        self.status_var.set(f"✅ 已解密还原 {len(paths)} 个产物至右侧画廊，云端密文已阅后即焚销毁")
+        report = format_burn_report(len(paths), burn_res)
+        self.status_var.set(report)
         if auto_mode:
             if self._tray is not None and self._tray.active and self._hidden_to_tray:
-                self._tray.notify_balloon(
-                    "Kiss-Shot 密文产物已就绪",
-                    f"已自动解密还原 {len(paths)} 个文件至本地画廊，远端密文分片已销毁。",
-                )
+                self._tray.notify_balloon("Kiss-Shot 密文产物已就绪", report)
             return
         if messagebox.askyesno(
-            "解密完成（阅后即焚已执行）",
-            f"已验证并解密 {len(paths)} 个文件至右侧画廊与目录：\n{self.output_dir}\n\n立即打开目录查看吗？",
+            "解密与条件清理完成",
+            f"{report}\n\n本地目录：\n{self.output_dir}\n\n立即打开目录查看吗？",
         ):
             _open_directory_cross_platform(self.output_dir)
 
@@ -1687,10 +2096,16 @@ def run_panel(
     work_dir: str | None = None,
     port: int = DEFAULT_LOCAL_PORT,
     start_minimized: bool = False,
+    initial_output_directory: str | None = None,
 ) -> None:
     enable_high_dpi()
     set_app_user_model_id(APP_USER_MODEL_ID)
     if signal_existing_instance(TRAY_CLASS_NAME, PANEL_WINDOW_TITLE):
         return
-    app = ZeroTrustBridgeApp(work_dir=work_dir, port=port, start_minimized=start_minimized)
+    app = ZeroTrustBridgeApp(
+        work_dir=work_dir,
+        port=port,
+        start_minimized=start_minimized,
+        initial_output_directory=initial_output_directory,
+    )
     app.mainloop()

@@ -22,10 +22,11 @@ from pathlib import Path
 import re
 import secrets
 import socket
+import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import urllib.error
 import urllib.request
 
@@ -45,11 +46,26 @@ from .crypto import (
     save_encrypted_secrets,
 )
 
-USER_AGENT = "kiss-shot/0.2"
+USER_AGENT = "kiss-shot/1.3"
 ADMIN_TOKEN_HEADER = "X-KissShot-Admin-Token"
 MAX_LOCAL_REQ_BYTES = 64 * 1024 * 1024
 MAX_SSE_LINE_BYTES = 4 * 1024 * 1024
 MAX_UPSTREAM_BODY_BYTES = 32 * 1024 * 1024
+CLIPBOARD_RETRY_INTERVAL = 30.0
+
+
+class _LocalBridgeHTTPServer(ThreadingHTTPServer):
+    """本地网桥独占端口服务器：禁用 SO_REUSEADDR，防止端口已被占用时静默双绑或劫持。"""
+
+    allow_reuse_address = False
+
+    def server_bind(self) -> None:
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        super().server_bind()
 
 _ALLOWED_HOST_RE = re.compile(r"^(?:127\.0\.0\.1|localhost)(?::\d{1,5})?$", re.IGNORECASE)
 _ALLOWED_ORIGIN_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost)(?::\d{1,5})?$", re.IGNORECASE)
@@ -132,47 +148,8 @@ class LocalBridgeState:
                 except Exception:
                     pass
 
-    def configure_with_ticket(
-        self,
-        raw_ticket: str,
-        passphrase_override: str = "",
-        persist: bool = True,
-    ) -> Tuple[bool, str]:
-        with self.lock:
-            pwd = passphrase_override.strip() or self.passphrase or _load_saved_passphrase(self.secrets_file)
-            if not pwd:
-                return False, "Passphrase not configured / 尚未设置加密口令"
-            try:
-                parsed = parse_handshake_ticket(raw_ticket, pwd)
-            except Exception as exc:
-                return False, f"Ticket decryption failed / 票据解密校验未通过: {exc}"
-
-            self.passphrase = pwd
-            self.base_url = parsed["base_url"]
-            self.route_path = parsed["route"]
-            self.session_salt = parsed["session_salt"]
-            self.cipher = derive_session_cipher(pwd, self.session_salt)
-
-            if persist:
-                try:
-                    clean_m = TICKET_PATTERN.search(raw_ticket)
-                    canonical = f"{TICKET_PREFIX}{clean_m.group(1)}" if clean_m else raw_ticket.strip()
-                    save_encrypted_secrets(
-                        self.state_file,
-                        {"ticket": canonical, "updated_at": int(time.time())},
-                    )
-                except Exception:
-                    pass
-
-        ok, msg = self.ping_remote()
-        self._notify()
-        return ok, msg
-
-    def ping_remote(self) -> Tuple[bool, str]:
-        with self.lock:
-            cipher = self.cipher
-            endpoint = self.endpoint_url
-            route = self.route_path
+    def _probe(self, endpoint: str, route: str, cipher: AESGCM) -> Tuple[bool, str]:
+        """对候选远端端点执行端到端 AES-256-GCM /health 握手探测，不修改当前活动状态。"""
         if not cipher or not endpoint:
             return False, "Bridge not bound / 尚未绑定远端票据"
 
@@ -194,15 +171,80 @@ class LocalBridgeState:
             hdr = json.loads(hdr_line.decode("utf-8"))
             ms = int((time.time() - t0) * 1000)
             if int(hdr.get("status", 0)) == 200:
-                with self.lock:
-                    self.last_ok_ts = int(time.time())
-                    self.last_err = ""
                 return True, f"E2EE AES-256-GCM handshake OK ({ms} ms)"
             return False, f"Upstream status={hdr.get('status')}: {body.decode('utf-8', 'ignore')[:80]}"
         except Exception as exc:
-            with self.lock:
-                self.last_err = str(exc)
             return False, f"Handshake failed: {exc}"
+
+    def configure_with_ticket(
+        self,
+        raw_ticket: str,
+        passphrase_override: str = "",
+        persist: bool = True,
+    ) -> Tuple[bool, str]:
+        """原子票据切换：先 _probe 握手验证，再落盘持久化，最后切换内存中的活动网桥状态。"""
+        with self.lock:
+            pwd = passphrase_override.strip() or self.passphrase or _load_saved_passphrase(self.secrets_file)
+        if not pwd:
+            return False, "Passphrase not configured / 尚未设置加密口令"
+        try:
+            parsed = parse_handshake_ticket(raw_ticket, pwd)
+        except Exception as exc:
+            return False, f"Ticket decryption failed / 票据解密校验未通过: {exc}"
+
+        cand_base = parsed["base_url"]
+        cand_route = parsed["route"]
+        cand_salt = parsed["session_salt"]
+        cand_cipher = derive_session_cipher(pwd, cand_salt)
+        cand_endpoint = f"{cand_base}{cand_route}"
+
+        ok, msg = self._probe(cand_endpoint, cand_route, cand_cipher)
+        if not ok:
+            with self.lock:
+                if not self.cipher:
+                    self.last_err = msg
+            self._notify()
+            return False, msg
+
+        if persist:
+            try:
+                clean_m = TICKET_PATTERN.search(raw_ticket)
+                canonical = f"{TICKET_PREFIX}{clean_m.group(1)}" if clean_m else raw_ticket.strip()
+                save_encrypted_secrets(
+                    self.state_file,
+                    {"ticket": canonical, "updated_at": int(time.time())},
+                )
+            except Exception as exc:
+                return False, f"Failed to persist bridge state / 状态落盘失败: {exc}"
+
+        with self.lock:
+            self.passphrase = pwd
+            self.base_url = cand_base
+            self.route_path = cand_route
+            self.session_salt = cand_salt
+            self.cipher = cand_cipher
+            self.last_ok_ts = int(time.time())
+            self.last_err = ""
+
+        self._notify()
+        return True, msg
+
+    def ping_remote(self) -> Tuple[bool, str]:
+        with self.lock:
+            cipher = self.cipher
+            endpoint = self.endpoint_url
+            route = self.route_path
+        if not cipher or not endpoint:
+            return False, "Bridge not bound / 尚未绑定远端票据"
+
+        ok, msg = self._probe(endpoint, route, cipher)
+        with self.lock:
+            if ok:
+                self.last_ok_ts = int(time.time())
+                self.last_err = ""
+            else:
+                self.last_err = msg
+        return ok, msg
 
     def snapshot(self, listen_port: int = DEFAULT_LOCAL_PORT) -> Dict[str, Any]:
         with self.lock:
@@ -442,16 +484,13 @@ def make_local_bridge_handler(state: LocalBridgeState, listen_port: int = DEFAUL
                 method="POST",
             )
 
+            headers_sent = False
             try:
                 with urllib.request.urlopen(req, timeout=300) as up_resp:
                     up_ct = (up_resp.headers.get("Content-Type") or "").lower()
-                    with state.lock:
-                        state.req_count += 1
-                        state.last_ok_ts = int(time.time())
-                        state.last_err = ""
-                    state._notify()
 
                     if "text/event-stream" in up_ct:
+                        self.close_connection = True
                         self.send_response(200)
                         self._send_security_headers(allowed_origin)
                         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -459,6 +498,7 @@ def make_local_bridge_handler(state: LocalBridgeState, listen_port: int = DEFAUL
                         self.send_header("X-Accel-Buffering", "no")
                         self.send_header("Connection", "close")
                         self.end_headers()
+                        headers_sent = True
 
                         seq = 0
                         verified_eof = False
@@ -486,7 +526,14 @@ def make_local_bridge_handler(state: LocalBridgeState, listen_port: int = DEFAUL
                             self.wfile.flush()
 
                         if not verified_eof:
+                            self.close_connection = True
                             raise ValueError("Truncated SSE stream: missing authenticated EOF tag")
+
+                        with state.lock:
+                            state.req_count += 1
+                            state.last_ok_ts = int(time.time())
+                            state.last_err = ""
+                        state._notify()
                     else:
                         raw_out = up_resp.read(MAX_UPSTREAM_BODY_BYTES + 1)
                         if len(raw_out) > MAX_UPSTREAM_BODY_BYTES:
@@ -496,21 +543,30 @@ def make_local_bridge_handler(state: LocalBridgeState, listen_port: int = DEFAUL
                         hdr = json.loads(hdr_line.decode("utf-8"))
                         raw_ct = str(hdr.get("ct", "application/json")).lower()
                         safe_ct = "text/plain; charset=utf-8" if raw_ct.startswith("text/plain") else "application/json; charset=utf-8"
+                        with state.lock:
+                            state.req_count += 1
+                            state.last_ok_ts = int(time.time())
+                            state.last_err = ""
+                        state._notify()
+                        self.close_connection = True
                         self.send_response(int(hdr.get("status", 200)))
                         self._send_security_headers(allowed_origin)
                         self.send_header("Content-Type", safe_ct)
                         self.send_header("Content-Length", str(len(resp_body)))
                         self.send_header("Connection", "close")
                         self.end_headers()
+                        headers_sent = True
                         self.wfile.write(resp_body)
             except Exception as exc:
+                self.close_connection = True
                 with state.lock:
                     state.last_err = str(exc)
                 state._notify()
-                try:
-                    self._send_json(502, {"error": {"message": f"E2EE tunnel error: {exc}"}}, allowed_origin=allowed_origin)
-                except Exception:
-                    pass
+                if not headers_sent:
+                    try:
+                        self._send_json(502, {"error": {"message": f"E2EE tunnel error: {exc}"}}, allowed_origin=allowed_origin)
+                    except Exception:
+                        pass
 
     return LocalOpenAIBridgeHandler
 
@@ -577,15 +633,51 @@ def configure_local_bridge(
         return False, str(exc)
 
 
+def sillytavern_profiles(st_root: Path | str) -> List[str]:
+    """列举指定 SillyTavern 根目录 `data/*/settings.json` 下的所有合法用户配置档名称。"""
+    if not st_root:
+        return []
+    data_dir = Path(st_root) / "data"
+    if not data_dir.is_dir():
+        return []
+    found: List[str] = []
+    for child in sorted(data_dir.iterdir(), key=lambda p: p.name):
+        if child.is_dir() and (child / "settings.json").is_file():
+            found.append(child.name)
+    return found
+
+
 def bind_sillytavern_client(
     st_root: Path,
     port: int = DEFAULT_LOCAL_PORT,
     model_alias: str = DEFAULT_MODEL_ALIAS,
     st_server: str = "http://127.0.0.1:8000",
+    profile: Optional[str] = None,
 ) -> Tuple[int, bool]:
-    """可选辅助工具：将用户显式指定的本地客户端目录指向本地加密网桥"""
-    if not st_root or not st_root.exists():
+    """
+    可选辅助工具：将用户显式指定的单个 SillyTavern profile 指向本地加密网桥。
+    - 仅允许单 profile 绑定（多 profile 目录下未显式传入 `profile` 时抛出 `ValueError`，绝不批量覆写）。
+    - 首次修改目标 profile 的 `settings.json` 前自动备份原始配置至同目录 `settings.before-kiss-shot.json`（已存在则不覆盖）。
+    """
+    root = Path(st_root) if st_root else None
+    if not root or not root.exists():
         return 0, False
+
+    profiles = sillytavern_profiles(root)
+    if profile is not None:
+        clean_prof = str(profile).strip()
+        if not clean_prof or "/" in clean_prof or "\\" in clean_prof or ".." in clean_prof or clean_prof not in profiles:
+            raise ValueError(f"SillyTavern profile not found or invalid: {profile!r} (available: {profiles})")
+        target_profile = clean_prof
+    else:
+        if not profiles:
+            return 0, False
+        if len(profiles) > 1:
+            raise ValueError(
+                f"Multiple SillyTavern profiles found ({', '.join(profiles)}); "
+                "pass profile=<name> explicitly to bind a single profile."
+            )
+        target_profile = profiles[0]
 
     bridge_v1 = f"http://127.0.0.1:{port}/v1"
 
@@ -599,55 +691,115 @@ def bind_sillytavern_client(
         oai["stream_openai"] = True
         return settings
 
-    updated_cnt = 0
-    data_dir = st_root / "data"
-    if data_dir.exists():
-        for sp in data_dir.glob("*/settings.json"):
-            try:
-                d = json.loads(sp.read_text(encoding="utf-8"))
-                _patch(d)
-                fd, tmp_p = tempfile.mkstemp(dir=str(sp.parent), prefix=".ks_st_", suffix=".tmp")
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(d, f, ensure_ascii=False, indent=4)
-                os.replace(tmp_p, sp)
-                updated_cnt += 1
-            except Exception:
-                pass
+    sp = root / "data" / target_profile / "settings.json"
+    raw_orig = sp.read_text(encoding="utf-8")
+    d = json.loads(raw_orig)
+    backup_p = sp.parent / "settings.before-kiss-shot.json"
+    if not backup_p.exists():
+        fd_b, tmp_b = tempfile.mkstemp(dir=str(sp.parent), prefix=".ks_st_bak_", suffix=".tmp")
+        with os.fdopen(fd_b, "w", encoding="utf-8") as fb:
+            fb.write(raw_orig)
+        os.replace(tmp_b, backup_p)
+
+    _patch(d)
+    fd, tmp_p = tempfile.mkstemp(dir=str(sp.parent), prefix=".ks_st_", suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=4)
+    os.replace(tmp_p, sp)
+    updated_cnt = 1
 
     api_ok = False
-    try:
-        jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-        with opener.open(urllib.request.Request(f"{st_server}/csrf-token", method="GET"), timeout=1.5) as r:
-            csrf = json.loads(r.read().decode("utf-8")).get("token", "")
-        hdrs = {"Content-Type": "application/json", "X-CSRF-Token": csrf}
-        with opener.open(urllib.request.Request(f"{st_server}/api/settings/get", data=b"{}", headers=hdrs, method="POST"), timeout=2) as r:
-            raw_s = json.loads(r.read().decode("utf-8")).get("settings")
-            s_dict = json.loads(raw_s) if isinstance(raw_s, str) else raw_s
-        if isinstance(s_dict, dict):
-            _patch(s_dict)
-            body = json.dumps(s_dict, ensure_ascii=False, indent=4).encode("utf-8")
-            with opener.open(urllib.request.Request(f"{st_server}/api/settings/save", data=body, headers=hdrs, method="POST"), timeout=2) as r:
-                api_ok = json.loads(r.read().decode("utf-8")).get("result") == "ok"
-    except Exception:
-        pass
+    if st_server:
+        try:
+            jar = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+            with opener.open(urllib.request.Request(f"{st_server}/csrf-token", method="GET"), timeout=1.5) as r:
+                csrf = json.loads(r.read().decode("utf-8")).get("token", "")
+            hdrs = {"Content-Type": "application/json", "X-CSRF-Token": csrf}
+            with opener.open(
+                urllib.request.Request(f"{st_server}/api/settings/get", data=b"{}", headers=hdrs, method="POST"),
+                timeout=2,
+            ) as r:
+                raw_s = json.loads(r.read().decode("utf-8")).get("settings")
+                s_dict = json.loads(raw_s) if isinstance(raw_s, str) else raw_s
+            if isinstance(s_dict, dict):
+                _patch(s_dict)
+                body = json.dumps(s_dict, ensure_ascii=False, indent=4).encode("utf-8")
+                with opener.open(
+                    urllib.request.Request(f"{st_server}/api/settings/save", data=body, headers=hdrs, method="POST"),
+                    timeout=2,
+                ) as r:
+                    api_ok = json.loads(r.read().decode("utf-8")).get("result") == "ok"
+        except Exception:
+            pass
 
     return updated_cnt, api_ok
 
 
-def _clipboard_watcher_loop(state: LocalBridgeState) -> None:
-    last_seen = ""
-    while True:
+def extract_exact_ticket(text: str) -> Optional[str]:
+    """仅当剪贴板去除首尾空白后完整匹配单条 KISSSHOT_TICKET:... 时返回规范票据串，拒绝混杂文本。"""
+    if not text:
+        return None
+    stripped = text.strip()
+    m = TICKET_PATTERN.fullmatch(stripped)
+    if not m:
+        return None
+    return f"{TICKET_PREFIX}{m.group(1)}"
+
+
+class ClipboardTicketWatcher:
+    """严格全串匹配剪贴板握手票据，首次绑定失败后按 30s 退避周期自动重试。"""
+
+    def __init__(
+        self,
+        state: LocalBridgeState,
+        *,
+        retry_interval: float = CLIPBOARD_RETRY_INTERVAL,
+        read_fn: Callable[[], str] = read_clipboard_text,
+        clear_fn: Callable[..., Any] = clear_clipboard_text,
+    ) -> None:
+        self.state = state
+        self.retry_interval = float(retry_interval)
+        self.read_fn = read_fn
+        self.clear_fn = clear_fn
+        self.last_token: str = ""
+        self.last_attempt_ts: float = 0.0
+        self.last_ok: bool = False
+
+    def poll_once(self, now: Optional[float] = None) -> Optional[Tuple[bool, str]]:
+        txt = self.read_fn()
+        canonical = extract_exact_ticket(txt)
+        if not canonical:
+            return None
+        ts = time.monotonic() if now is None else float(now)
+        if canonical == self.last_token:
+            if self.last_ok:
+                return None
+            if (ts - self.last_attempt_ts) < self.retry_interval:
+                return None
+        self.last_token = canonical
+        self.last_attempt_ts = ts
+        ok, msg = self.state.configure_with_ticket(canonical)
+        self.last_ok = bool(ok)
+        if ok:
+            try:
+                self.clear_fn(expected=canonical)
+            except TypeError:
+                self.clear_fn()
+        return ok, msg
+
+
+def _clipboard_watcher_loop(state: LocalBridgeState, stop_event: Optional[threading.Event] = None) -> None:
+    watcher = ClipboardTicketWatcher(state)
+    while stop_event is None or not stop_event.is_set():
         try:
-            txt = read_clipboard_text()
-            if txt and TICKET_PREFIX in txt:
-                m = TICKET_PATTERN.search(txt)
-                if m and m.group(1) != last_seen:
-                    last_seen = m.group(1)
-                    ok, msg = state.configure_with_ticket(f"{TICKET_PREFIX}{last_seen}")
-                    if ok:
-                        clear_clipboard_text()
-                    print(f"[Kiss-Shot] Clipboard ticket detected -> {'OK (clipboard scrubbed)' if ok else 'PENDING'}: {msg}", flush=True)
+            res = watcher.poll_once()
+            if res is not None:
+                ok, msg = res
+                print(
+                    f"[Kiss-Shot] Clipboard ticket detected -> {'OK (clipboard scrubbed)' if ok else 'RETRY IN 30s'}: {msg}",
+                    flush=True,
+                )
         except Exception:
             pass
         time.sleep(1.2)
@@ -659,15 +811,20 @@ def start_local_bridge_background(
     watch_clipboard: bool = True,
     on_status_change: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[Optional[ThreadingHTTPServer], LocalBridgeState]:
-    """启动本地 OpenAI 兼容加密网桥后台线程（若端口已监听则复用加密 IPC 状态查询）"""
+    """
+    直接尝试以 allow_reuse_address=False 独占绑定 127.0.0.1:port 启动本地加密网桥后台线程。
+    若端口已被其他进程占用导致绑定失败，立即返回 (None, state)，绝不复用未知监听进程。
+    """
     state = LocalBridgeState(work_dir=work_dir)
     if on_status_change:
         state.on_status_change = on_status_change
 
-    if is_port_listening(port):
+    try:
+        srv = _LocalBridgeHTTPServer(("127.0.0.1", port), make_local_bridge_handler(state, listen_port=port))
+    except OSError as exc:
+        state.last_err = f"Port 127.0.0.1:{port} unavailable: {exc}"
         return None, state
 
-    srv = ThreadingHTTPServer(("127.0.0.1", port), make_local_bridge_handler(state, listen_port=port))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     if watch_clipboard:
         threading.Thread(target=_clipboard_watcher_loop, args=(state,), daemon=True).start()

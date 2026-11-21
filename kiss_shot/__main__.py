@@ -21,8 +21,8 @@ import time
 from .crypto import DEFAULT_LOCAL_PORT
 from .local_bridge import (
     LocalBridgeState,
+    _LocalBridgeHTTPServer,
     _clipboard_watcher_loop,
-    is_port_listening,
     make_local_bridge_handler,
 )
 from .remote_gateway import RemoteGatewayContext, make_gateway_handler
@@ -62,11 +62,13 @@ def _cmd_shortcut(args: argparse.Namespace) -> int:
 
 
 def _cmd_bridge(args: argparse.Namespace) -> int:
-    if is_port_listening(args.port):
-        print(f"[Kiss-Shot] Port 127.0.0.1:{args.port} is already listening.", file=sys.stderr)
+    state = LocalBridgeState(work_dir=args.work_dir, model_alias=args.model_alias)
+    try:
+        srv = _LocalBridgeHTTPServer(("127.0.0.1", args.port), make_local_bridge_handler(state, listen_port=args.port))
+    except OSError as exc:
+        print(f"[Kiss-Shot] Port 127.0.0.1:{args.port} is already in use or unavailable ({exc}).", file=sys.stderr)
         return 1
 
-    state = LocalBridgeState(work_dir=args.work_dir, model_alias=args.model_alias)
     passphrase = args.passphrase or os.environ.get("KISSSHOT_PASSPHRASE", "").strip()
     if passphrase:
         state.passphrase = passphrase
@@ -80,7 +82,6 @@ def _cmd_bridge(args: argparse.Namespace) -> int:
     if not args.no_clipboard:
         threading.Thread(target=_clipboard_watcher_loop, args=(state,), daemon=True).start()
 
-    srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_local_bridge_handler(state, listen_port=args.port))
     print("=" * 72)
     print(f" 🔒 Zero-Trust Local OpenAI Bridge listening on http://127.0.0.1:{args.port}/v1")
     print(" 📋 Watching clipboard for KISSSHOT_TICKET:... (Ctrl+C to stop)")
@@ -128,7 +129,7 @@ def _cmd_remote_gateway(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="kiss-shot",
         description="Zero-Trust End-to-End Encrypted Inference Bridge & Ephemeral Ciphertext Mailbox.",
@@ -161,13 +162,21 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="Externally reachable HTTPS ingress URL pointing to --listen-port (e.g. https://pod-8081.proxy.runpod.net)",
     )
-    p_rem.add_argument("--listen-host", default="0.0.0.0", help="Bind address on remote container (default: 0.0.0.0)")
+    p_rem.add_argument(
+        "--listen-host",
+        default="127.0.0.1",
+        help="Bind address on remote container (default: 127.0.0.1; pass 0.0.0.0 only if external ingress proxy requires it)",
+    )
     p_rem.add_argument("--listen-port", type=int, default=8081, help="Bind port for AEAD gateway (default: 8081)")
     p_rem.add_argument("--upstream", default="http://127.0.0.1:8080", help="Local loopback inference server URL")
     p_rem.add_argument("--route", default=None, help="Custom route path (default: random /v1/ks-<hex>)")
     p_rem.add_argument("--passphrase", default="", help="Passphrase (prefer interactive prompt or KISSSHOT_PASSPHRASE)")
     p_rem.set_defaults(func=_cmd_remote_gateway)
+    return parser
 
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
     args = parser.parse_args(argv)
     if not hasattr(args, "func"):
         parser.print_help()
