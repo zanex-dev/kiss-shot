@@ -11,7 +11,7 @@
 <p align="center">
   <a href="#verification--test-suite"><img src="https://img.shields.io/badge/tests-25%2F25%20passing-brightgreen" alt="CI" /></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-v1.3.0-be123c" alt="Version v1.3.0" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-e11d48.svg" alt="License: MIT" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-e11d48.svg" alt="License: PolyForm Noncommercial 1.0.0" /></a>
   <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB.svg" alt="Python 3.10+" /></a>
   <img src="https://img.shields.io/badge/codename-Kiss--Shot%20(%E5%A7%AC%E4%B8%9D%E7%A7%80%E5%BF%92)-9f1239" alt="Codename" />
 </p>
@@ -148,4 +148,6 @@ python -m unittest discover -s tests -v
 
 ## License
 
-Released under the [MIT License](LICENSE).
+Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) (`PolyForm-Noncommercial-1.0.0`) — **free for personal, educational, and noncommercial use; commercial use, paid SaaS, bundling, or resale of the code or `assets/` artwork is strictly prohibited** without prior written authorization from zanex-dev.
+
+`Required Notice: Copyright (c) 2026 zanex (zanex-dev) (https://github.com/zanex-dev/kiss-shot)`
